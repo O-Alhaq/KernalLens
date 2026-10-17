@@ -1,0 +1,105 @@
+#!/usr/bin/env bash
+# Root is required; all interfaces are created inside a disposable namespace.
+set -euo pipefail
+cd "$(dirname "$0")/.."
+if [[ ${1:-} != --isolated ]]; then
+    if [[ $EUID != 0 ]]; then
+        echo 'Run sudo make test (requires BPF and network administration privileges).' >&2
+        exit 1
+    fi
+    exec unshare --net bash "$0" --isolated
+fi
+
+test_dir=$(mktemp -d)
+agent_pid=
+sender_pid=
+cleanup() {
+    if [[ -n $agent_pid ]]; then
+        kill -TERM "$agent_pid" 2>/dev/null || true
+        wait "$agent_pid" 2>/dev/null || true
+    fi
+    if [[ -n $sender_pid ]]; then
+        kill -TERM "$sender_pid" 2>/dev/null || true
+        wait "$sender_pid" 2>/dev/null || true
+    fi
+    rm -rf "$test_dir"
+}
+trap cleanup EXIT
+
+ip link add kl-send type veth peer name kl-recv
+# Keep sender and receiver in different namespaces so traffic crosses the veth
+# instead of taking the kernel's local-delivery shortcut.
+unshare --net sh -c 'touch "$1"; exec sleep 120' sh "$test_dir/sender-ready" &
+sender_pid=$!
+for ((attempt=0; attempt<100; attempt++)); do
+    [[ -e $test_dir/sender-ready ]] && break
+    sleep 0.05
+done
+test -e "$test_dir/sender-ready"
+ip link set kl-send netns "$sender_pid"
+nsenter -t "$sender_pid" -n ip address add 192.0.2.1/24 dev kl-send
+nsenter -t "$sender_pid" -n ip link set kl-send up
+ip address add 192.0.2.2/24 dev kl-recv
+ip link set kl-recv up
+expected_ifindex=$(ip -o link show kl-recv | awk -F': ' '{print $1}')
+
+./build/kernellens-agent kl-recv >"$test_dir/events" 2>"$test_dir/agent.log" &
+agent_pid=$!
+for ((attempt=0; attempt<100; attempt++)); do
+    if grep -q 'Attached XDP_PASS' "$test_dir/agent.log"; then
+        break
+    fi
+    if ! kill -0 "$agent_pid" 2>/dev/null; then
+        cat "$test_dir/agent.log" >&2
+        exit 1
+    fi
+    sleep 0.05
+done
+grep -q 'Attached XDP_PASS' "$test_dir/agent.log"
+
+# A second instance must fail without replacing the first instance's program.
+if timeout --signal=TERM 3 ./build/kernellens-agent kl-recv >"$test_dir/second.out" 2>"$test_dir/second.log"; then
+    echo 'FAIL: second attachment unexpectedly succeeded' >&2
+    exit 1
+fi
+grep -q 'Cannot attach XDP' "$test_dir/second.log"
+nsenter -t "$sender_pid" -n ping -I kl-send -c 3 -W 2 192.0.2.2
+for ((attempt=0; attempt<100; attempt++)); do
+    if grep -q 'packet_length=98$' "$test_dir/events"; then
+        break
+    fi
+    sleep 0.05
+done
+kill -INT "$agent_pid"
+wait "$agent_pid"
+agent_pid=
+cat "$test_dir/agent.log"
+cat "$test_dir/events"
+awk -v idx="$expected_ifindex" '
+    /^timestamp=[0-9]+ ifindex=[0-9]+ packet_length=[0-9]+$/ {
+        split($1, ts, "="); split($2, iface, "="); split($3, len, "=");
+        if (ts[2] > 0 && iface[2] == idx && len[2] == 98) found=1;
+    }
+    END { exit !found }
+' "$test_dir/events"
+grep -q 'Detached XDP' "$test_dir/agent.log"
+if ip -details link show kl-recv | grep -q 'prog/xdp'; then
+    echo 'FAIL: XDP remains attached' >&2
+    exit 1
+fi
+
+# Reattachment also verifies that cleanup released the attachment.
+./build/kernellens-agent kl-recv >"$test_dir/restart.out" 2>"$test_dir/restart.log" &
+agent_pid=$!
+for ((attempt=0; attempt<100; attempt++)); do
+    if grep -q 'Attached XDP_PASS' "$test_dir/restart.log"; then
+        break
+    fi
+    sleep 0.05
+done
+grep -q 'Attached XDP_PASS' "$test_dir/restart.log"
+kill -TERM "$agent_pid"
+wait "$agent_pid"
+agent_pid=
+grep -q 'Detached XDP' "$test_dir/restart.log"
+echo 'PASS: packet events, XDP_PASS delivery, attachment conflict, SIGINT/SIGTERM cleanup, reattach'
