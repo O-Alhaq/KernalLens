@@ -13,7 +13,7 @@ from backend.receiver import validate_message
 def check(path, ifindex):
     with open(path) as stream:
         events = [validate_message(json.loads(line))["event"] for line in stream]
-    matching = [event for event in events if event["ifindex"] == ifindex
+    matching = [event for event in events if event.get("ifindex") == ifindex
                 and event["timestamp"] > 0 and event["src_ip"] == "192.0.2.1"
                 and event["dst_ip"] == "192.0.2.2"]
     tcp = [event for event in matching if event["protocol"] == "TCP"

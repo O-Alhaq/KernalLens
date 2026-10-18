@@ -4,7 +4,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 if [[ ${1:-} != --isolated ]]; then
     if [[ $EUID != 0 ]]; then
-        echo 'Run sudo make test-m2, test-m3, or test-m4 (requires BPF and network administration privileges).' >&2
+        echo 'Run sudo make test-m2, test-m3, test-m4, or test-m5 (requires BPF and network administration privileges).' >&2
         exit 1
     fi
     exec unshare --net bash "$0" --isolated
@@ -16,6 +16,12 @@ sender_pid=
 receiver_pid=
 traffic_pid=
 cleanup() {
+    local cleanup_status=$?
+    if [[ $cleanup_status != 0 ]]; then
+        for log in agent.log python.log traffic.log; do
+            [[ ! -f $test_dir/$log ]] || cat "$test_dir/$log" >&2
+        done
+    fi
     if [[ -n $traffic_pid ]]; then
         kill -TERM "$traffic_pid" 2>/dev/null || true
         wait "$traffic_pid" 2>/dev/null || true
@@ -54,10 +60,14 @@ ip link set kl-recv up
 expected_ifindex=$(ip -o link show kl-recv | awk -F': ' '{print $1}')
 
 ipc_arguments=()
+host_arguments=()
+if [[ ${KERNELLENS_TEST_M5:-0} == 1 ]]; then
+    host_arguments=(--host)
+fi
 if [[ ${KERNELLENS_TEST_M3:-0} == 1 ]]; then
     ipc_arguments=("$test_dir/agent.sock")
 fi
-./build/kernellens-agent kl-recv "${ipc_arguments[@]}" >"$test_dir/events" 2>"$test_dir/agent.log" &
+./build/kernellens-agent "${host_arguments[@]}" kl-recv "${ipc_arguments[@]}" >"$test_dir/events" 2>"$test_dir/agent.log" &
 agent_pid=$!
 for ((attempt=0; attempt<100; attempt++)); do
     if grep -q 'Attached XDP_PASS' "$test_dir/agent.log"; then
@@ -70,6 +80,26 @@ for ((attempt=0; attempt<100; attempt++)); do
     sleep 0.05
 done
 grep -q 'Attached XDP_PASS' "$test_dir/agent.log"
+if [[ ${KERNELLENS_TEST_M5:-0} == 1 ]]; then
+    for ((attempt=0; attempt<100; attempt++)); do
+        grep -q 'Attached host tracepoints' "$test_dir/agent.log" && break
+        sleep 0.05
+    done
+    grep -q 'Attached host tracepoints' "$test_dir/agent.log"
+    # Save only program IDs owned by this agent; unrelated host BPF is untouched.
+    python3 - "$agent_pid" "$test_dir/program_ids" <<'PY'
+import pathlib
+import sys
+
+identifiers = set()
+for fdinfo in pathlib.Path(f"/proc/{sys.argv[1]}/fdinfo").iterdir():
+    for line in fdinfo.read_text().splitlines():
+        if line.startswith("prog_id:"):
+            identifiers.add(int(line.split()[1]))
+assert len(identifiers) == 7, f"expected XDP plus six host programs, got {identifiers}"
+pathlib.Path(sys.argv[2]).write_text("\n".join(map(str, identifiers)))
+PY
+fi
 if [[ ${KERNELLENS_TEST_M3:-0} == 1 ]]; then
     timeout 45 python3 backend/receiver.py "$test_dir/agent.sock" >"$test_dir/python.events" 2>"$test_dir/python.log" &
     receiver_pid=$!
@@ -104,6 +134,14 @@ if [[ ${KERNELLENS_TEST_M4:-0} == 1 ]]; then
     done
     python3 tests/check_network_events.py "$test_dir/python.events" "$expected_ifindex"
 fi
+if [[ ${KERNELLENS_TEST_M5:-0} == 1 ]]; then
+    "$PWD/build/host-activity" >"$test_dir/host.metadata"
+    for ((attempt=0; attempt<100; attempt++)); do
+        python3 tests/check_host_events.py "$test_dir/python.events" "$test_dir/host.metadata" "$PWD/build/host-activity" --quiet && break
+        sleep 0.05
+    done
+    python3 tests/check_host_events.py "$test_dir/python.events" "$test_dir/host.metadata" "$PWD/build/host-activity"
+fi
 for ((attempt=0; attempt<100; attempt++)); do
     if grep -q 'packet_length=98$' "$test_dir/events"; then
         break
@@ -137,12 +175,32 @@ from backend.receiver import validate_message
 
 with open(sys.argv[1]) as stream:
     messages = [validate_message(json.loads(line)) for line in stream]
-assert any(message["event"]["ifindex"] == int(sys.argv[2])
+assert any(message["event"].get("ifindex") == int(sys.argv[2])
            and message["event"]["timestamp"] > 0
            and message["event"]["packet_length"] == 98 for message in messages)
 print("PASS: eBPF → C agent → Unix socket → validated Python event")
 for message in messages:
     print(json.dumps(message))
+PY
+fi
+if [[ ${KERNELLENS_TEST_M5:-0} == 1 ]]; then
+    grep -q 'Released host tracepoints and maps' "$test_dir/agent.log"
+    python3 - "$test_dir/program_ids" <<'PY'
+import json
+import pathlib
+import subprocess
+import sys
+import time
+
+owned = set(map(int, pathlib.Path(sys.argv[1]).read_text().splitlines()))
+for _ in range(50):
+    remaining = {program["id"] for program in json.loads(subprocess.check_output(
+        ["bpftool", "-j", "prog", "show"], text=True, timeout=3))}
+    if not owned & remaining:
+        break
+    time.sleep(0.1)
+assert not owned & remaining, f"programs still loaded after agent exit: {owned & remaining}"
+print("PASS: owned host/XDP programs unloaded; tracepoint links and maps released")
 PY
 fi
 if ip -details link show kl-recv | grep -q 'prog/xdp'; then

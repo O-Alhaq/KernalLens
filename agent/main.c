@@ -11,6 +11,7 @@
 #include "event.h"
 #include "ipc.h"
 #include "xdp_test.skel.h"
+#include "host.skel.h"
 
 static volatile sig_atomic_t stopping;
 
@@ -54,13 +55,22 @@ static void stop(int signal_number)
 static int print_event(void *context, void *data, size_t size)
 {
     struct packet_event event;
+    int error = ipc_route_event(context, data, size);
 
-    if (size != sizeof(event)) {
-        fprintf(stderr, "Unexpected event size: %zu\n", size);
-        return -EINVAL;
+    if (error) {
+        fprintf(stderr, "Invalid ring buffer record (size=%zu)\n", size);
+        return error;
+    }
+    if (size == sizeof(struct host_event)) {
+        struct host_event host;
+
+        memcpy(&host, data, sizeof(host));
+        if (printf("host_event=%u timestamp=%" PRIu64 " pid=%u uid=%u gid=%u\n",
+                   host.kind, (uint64_t)host.timestamp, host.pid, host.uid, host.gid) < 0)
+            return -EIO;
+        return 0;
     }
     memcpy(&event, data, sizeof(event));
-    ipc_publish(context, &event);
     if (printf("timestamp=%" PRIu64 " ifindex=%" PRIu32
                " packet_length=%" PRIu32 "\n",
                (uint64_t)event.timestamp, (uint32_t)event.ifindex,
@@ -72,15 +82,23 @@ static int print_event(void *context, void *data, size_t size)
 int main(int argc, char **argv)
 {
     struct xdp_test_bpf *skeleton = NULL;
+    struct host_bpf *host = NULL;
     struct bpf_link *link = NULL;
     struct ring_buffer *ring = NULL;
     struct sigaction action = { .sa_handler = stop };
     unsigned int ifindex;
     int error = 0;
     struct ipc_server ipc = { .listener = -1, .client = -1 };
+    const char *program_name = argv[0];
+    int host_enabled = argc > 1 && !strcmp(argv[1], "--host");
+
+    if (host_enabled) {
+        argc--;
+        argv++;
+    }
 
     if (argc != 2 && argc != 3) {
-        fprintf(stderr, "Usage: %s INTERFACE [SOCKET_PATH]\n", argv[0]);
+        fprintf(stderr, "Usage: %s [--host] INTERFACE [SOCKET_PATH]\n", program_name);
         return 1;
     }
     ifindex = if_nametoindex(argv[1]);
@@ -123,6 +141,23 @@ int main(int argc, char **argv)
     }
     fprintf(stderr, "Attached XDP_PASS to %s (ifindex=%u). Ctrl-C to stop.\n",
             argv[1], ifindex);
+    if (host_enabled) {
+        host = host_bpf__open();
+        if (!host) {
+            error = -errno;
+            goto cleanup;
+        }
+        error = bpf_map__reuse_fd(host->maps.events, bpf_map__fd(skeleton->maps.events));
+        if (!error)
+            error = host_bpf__load(host);
+        if (!error)
+            error = host_bpf__attach(host);
+        if (error) {
+            fprintf(stderr, "Cannot attach host tracepoints: %s\n", strerror(-error));
+            goto cleanup;
+        }
+        fprintf(stderr, "Attached host tracepoints.\n");
+    }
     while (!stopping) {
         ipc_poll(&ipc);
         error = ring_buffer__poll(ring, 100);
@@ -138,6 +173,10 @@ int main(int argc, char **argv)
     }
 
 cleanup:
+    if (host) {
+        host_bpf__destroy(host);
+        fprintf(stderr, "Released host tracepoints and maps.\n");
+    }
     ipc_close(&ipc);
     if (link) {
         int detach_error = bpf_link__destroy(link);

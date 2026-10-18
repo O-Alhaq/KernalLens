@@ -3,7 +3,7 @@
 KernelLens is a real-time eBPF-based telemetry framework for hybrid host and network threat detection.
 
 ## Current Milestone
-M4 - Network Telemetry
+M5 - Host Telemetry
 
 The C XDP program sends packet events through a BPF ring buffer to a C
 libbpf agent. Every packet returns `XDP_PASS`, including when the ring buffer
@@ -11,6 +11,11 @@ is full (in that case the event is skipped). The program parses Ethernet, IPv4,
 TCP, and UDP headers for telemetry. The agent serves a Python receiver over a Unix domain socket.
 Python only validates and prints messages; no detection or later milestone
 functionality is included.
+
+Host telemetry is opt-in. The network-only invocation below remains unchanged;
+add `--host` to collect process, syscall, and privilege records alongside packets.
+This milestone keeps separate network and host record formats rather than
+introducing the later unified event model.
 
 Prerequisites: Linux with BTF, BPF ring buffers and XDP BPF-link support,
 Clang/LLVM with the BPF target, libbpf development headers, bpftool, pkg-config,
@@ -23,7 +28,8 @@ types for the CO-RE build; the target kernel must expose BTF.
 make
 ```
 
-This builds `build/xdp_test.bpf.o`, generates `build/xdp_test.skel.h`, and links
+This builds `build/xdp_test.bpf.o` and `build/host.bpf.o`, generates both libbpf
+skeletons, and links
 `build/kernellens-agent`. `make clean` removes generated build files.
 
 Run on a selected interface with BPF/network administration privileges:
@@ -51,6 +57,64 @@ sudo ./build/kernellens-agent INTERFACE /run/kernellens/events.sock
 ```bash
 sudo python3 backend/receiver.py /run/kernellens/events.sock
 ```
+
+To enable host telemetry, start the agent with:
+
+```bash
+sudo ./build/kernellens-agent --host INTERFACE /run/kernellens/events.sock
+```
+
+The interface must still support XDP. The agent loads host tracepoints after
+attaching XDP and reuses that program's ring-buffer map FD. If a required host
+hook cannot load or attach, startup fails and releases all its resources,
+including XDP; it does not silently run a partial host sensor. Host support
+requires BTF/CO-RE, BPF task helpers, `CONFIG_FTRACE_SYSCALLS` and these hooks:
+
+| Tracepoints | Collected activity |
+| --- | --- |
+| `sched:sched_process_exec` | Successful execution, command name and exec filename |
+| `syscalls:sys_enter_setuid`, `syscalls:sys_exit_setuid` | Completed setuid attempts and return values |
+| `syscalls:sys_enter_setgid`, `syscalls:sys_exit_setgid` | Completed setgid attempts and return values |
+| `sched:sched_process_exit` | Remove pending per-thread syscall state; emits no exit event |
+
+No kprobes are used. `setuid` and `setgid` are a deliberately small set of
+security-relevant credential operations. Successful calls that change an
+effective UID/GID produce an additional `privilege_change` event. Failed calls
+and successful no-ops produce syscall telemetry only. This compares actual
+credentials; it does not classify a change as an attack or take any response.
+Other credential syscalls, saved/filesystem IDs, and supplementary groups are
+not collected in M5.
+
+Host records use the same JSON envelope and schema version as network events:
+
+```json
+{"message_type":"event","schema_version":1,"event":{"timestamp":123456789,"event_category":"process","event_type":"process_exec","pid":4217,"ppid":4100,"uid":1000,"gid":1000,"process_name":"bash","process_path":"/usr/bin/bash","syscall":null,"syscall_return":null,"previous_uid":null,"previous_gid":null}}
+```
+
+The category/type pairs are `process`/`process_exec`, `syscall`/`syscall_event`,
+and `privilege`/`privilege_change`. PID is the process TGID, PPID is the immediate
+parent TGID, and UID/GID are effective credentials as represented in the initial
+user namespace. Host tracepoints observe system-wide activity, including when
+the agent runs in a temporary network namespace; there is no ancestor-chain or
+process-to-network tracking. Timestamp uses the same monotonic clock as packets.
+
+`process_name` holds up to 15 bytes. `process_path` is the bounded exec filename
+from the successful-exec tracepoint (up to 255 bytes), not a canonical resolved
+path; it may be relative or name a script. A read failure or unavailable path
+is `null`. Syscall and privilege records have a null path, `syscall` equal to
+`setuid` or `setgid`, and a signed kernel `syscall_return` (negative errno on
+failure). Only privilege records contain numeric `previous_uid`/`previous_gid`;
+other records set them to null. Filenames and names are JSON escaped, with
+non-ASCII bytes represented individually as `\u00XX` to handle arbitrary Linux
+filename bytes safely.
+
+The agent dispatches the two distinct binary record sizes and the host kind
+discriminator. Network JSON is unchanged. The Python receiver validates each
+category's fields and prints the full envelope. Host entry/exit matching uses
+a bounded 4096-entry per-thread map, removed on completion/thread exit. A full
+map or ring buffer may omit telemetry; there is no replay. This state only
+pairs monitored syscall entries/exits and is not process lineage. Closing the
+agent destroys its unpinned tracepoint links and maps on normal exit or failure.
 
 The socket is accessible only to its owner (root in this example). The agent
 continues printing M2 terminal events. The Python receiver prints validated
@@ -112,6 +176,7 @@ Run the privileged integration tests after building:
 sudo make test-m2
 sudo make test-m3
 sudo make test-m4
+sudo make test-m5
 ```
 
 The test requires `ip`, `ping`, `unshare`, `nsenter`, and `timeout`. It creates a veth pair
@@ -129,3 +194,11 @@ TCP SYN and PSH/ACK flags, UDP's zero TCP flags and packet length, and positive
 protocol counters. Both echoes must succeed, demonstrating ordinary traffic
 passes while XDP is attached. The fixture verifies detach and reattachment,
 deletes the veth pair, and releases its temporary namespaces on exit.
+
+The M5 target also enables host collection, runs `build/host-activity` as a
+short-lived child, and verifies exec metadata, successful/denied/no-op syscall
+records, and exactly two real effective UID/GID changes in Python's output.
+Only the test child drops its own credentials to UID/GID 65534 (GID 65533 if
+already 65534); the shell and agent retain theirs. The test snapshots only the
+agent's BPF program IDs and verifies they are unloaded after exit, checks socket
+cleanup, and repeats the M4 TCP/UDP traffic tests while host sensing is enabled.

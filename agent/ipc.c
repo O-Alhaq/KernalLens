@@ -137,6 +137,105 @@ void ipc_publish(struct ipc_server *server, const struct packet_event *event)
         send_record(server, record, (size_t)length);
 }
 
+/* Bounded byte escaping also keeps non-UTF-8 Linux filenames valid JSON.
+ * Non-ASCII filename bytes are represented individually as \u00XX. */
+static void quote_bytes(char *output, const char *input, size_t limit)
+{
+    static const char hex[] = "0123456789abcdef";
+
+    *output++ = '"';
+    for (size_t i = 0; i < limit && input[i]; i++) {
+        unsigned char byte = (unsigned char)input[i];
+
+        if (byte == '"' || byte == '\\') {
+            *output++ = '\\';
+            *output++ = (char)byte;
+        } else if (byte < 32 || byte >= 127) {
+            *output++ = '\\';
+            *output++ = 'u';
+            *output++ = '0';
+            *output++ = '0';
+            *output++ = hex[byte >> 4];
+            *output++ = hex[byte & 15];
+        } else {
+            *output++ = (char)byte;
+        }
+    }
+    *output++ = '"';
+    *output = '\0';
+}
+
+static int publish_host(struct ipc_server *server, const struct host_event *event)
+{
+    char record[3072], name[sizeof(event->process_name) * 6 + 3];
+    char path[sizeof(event->process_path) * 6 + 3];
+    char result[32] = "null", previous_uid[16] = "null", previous_gid[16] = "null";
+    const char *category, *type, *syscall = "null";
+    int length;
+
+    switch (event->kind) {
+    case HOST_PROCESS_EXEC:
+        category = "process";
+        type = "process_exec";
+        if (event->syscall != HOST_NO_SYSCALL)
+            return -EINVAL;
+        break;
+    case HOST_SYSCALL:
+    case HOST_PRIVILEGE_CHANGE:
+        category = event->kind == HOST_SYSCALL ? "syscall" : "privilege";
+        type = event->kind == HOST_SYSCALL ? "syscall_event" : "privilege_change";
+        if (event->syscall == HOST_SETUID)
+            syscall = "\"setuid\"";
+        else if (event->syscall == HOST_SETGID)
+            syscall = "\"setgid\"";
+        else
+            return -EINVAL;
+        snprintf(result, sizeof(result), "%" PRId64, (int64_t)event->syscall_return);
+        if (event->kind == HOST_PRIVILEGE_CHANGE) {
+            snprintf(previous_uid, sizeof(previous_uid), "%u", event->previous_uid);
+            snprintf(previous_gid, sizeof(previous_gid), "%u", event->previous_gid);
+        }
+        break;
+    default:
+        return -EINVAL;
+    }
+    quote_bytes(name, event->process_name, sizeof(event->process_name) - 1);
+    if (event->process_path[0])
+        quote_bytes(path, event->process_path, sizeof(event->process_path) - 1);
+    else
+        strcpy(path, "null");
+    length = snprintf(record, sizeof(record),
+        "{\"message_type\":\"event\",\"schema_version\":1,\"event\":{"
+        "\"timestamp\":%" PRIu64 ",\"event_category\":\"%s\",\"event_type\":\"%s\","
+        "\"pid\":%u,\"ppid\":%u,\"uid\":%u,\"gid\":%u,"
+        "\"process_name\":%s,\"process_path\":%s,\"syscall\":%s,"
+        "\"syscall_return\":%s,\"previous_uid\":%s,\"previous_gid\":%s}}\n",
+        (uint64_t)event->timestamp, category, type, event->pid, event->ppid,
+        event->uid, event->gid, name, path, syscall, result, previous_uid, previous_gid);
+    if (length < 0 || (size_t)length >= sizeof(record))
+        return -EOVERFLOW;
+    send_record(server, record, (size_t)length);
+    return 0;
+}
+
+int ipc_route_event(struct ipc_server *server, const void *data, size_t size)
+{
+    if (size == sizeof(struct packet_event)) {
+        struct packet_event event;
+
+        memcpy(&event, data, sizeof(event));
+        ipc_publish(server, &event);
+        return 0;
+    }
+    if (size == sizeof(struct host_event)) {
+        struct host_event event;
+
+        memcpy(&event, data, sizeof(event));
+        return publish_host(server, &event);
+    }
+    return -EINVAL;
+}
+
 void ipc_close(struct ipc_server *server)
 {
     struct stat info;
