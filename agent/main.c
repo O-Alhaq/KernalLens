@@ -7,6 +7,7 @@
 #include <bpf/libbpf.h>
 
 #include "event.h"
+#include "ipc.h"
 #include "xdp_test.skel.h"
 
 static volatile sig_atomic_t stopping;
@@ -21,12 +22,12 @@ static int print_event(void *context, void *data, size_t size)
 {
     struct packet_event event;
 
-    (void)context;
     if (size != sizeof(event)) {
         fprintf(stderr, "Unexpected event size: %zu\n", size);
         return -EINVAL;
     }
     memcpy(&event, data, sizeof(event));
+    ipc_publish(context, &event);
     if (printf("timestamp=%" PRIu64 " ifindex=%" PRIu32
                " packet_length=%" PRIu32 "\n",
                (uint64_t)event.timestamp, (uint32_t)event.ifindex,
@@ -43,9 +44,10 @@ int main(int argc, char **argv)
     struct sigaction action = { .sa_handler = stop };
     unsigned int ifindex;
     int error = 0;
+    struct ipc_server ipc = { .listener = -1, .client = -1 };
 
-    if (argc != 2) {
-        fprintf(stderr, "Usage: %s INTERFACE\n", argv[0]);
+    if (argc != 2 && argc != 3) {
+        fprintf(stderr, "Usage: %s INTERFACE [SOCKET_PATH]\n", argv[0]);
         return 1;
     }
     ifindex = if_nametoindex(argv[1]);
@@ -65,8 +67,15 @@ int main(int argc, char **argv)
         fprintf(stderr, "Cannot load eBPF object: %s\n", strerror(errno));
         return 1;
     }
+    if (argc == 3) {
+        error = ipc_open(&ipc, argv[2]);
+        if (error) {
+            fprintf(stderr, "Cannot open IPC socket: %s\n", strerror(-error));
+            goto cleanup;
+        }
+    }
     ring = ring_buffer__new(bpf_map__fd(skeleton->maps.events),
-                            print_event, NULL, NULL);
+                            print_event, &ipc, NULL);
     if (!ring) {
         error = -errno;
         fprintf(stderr, "Cannot open ring buffer: %s\n", strerror(-error));
@@ -82,6 +91,7 @@ int main(int argc, char **argv)
     fprintf(stderr, "Attached XDP_PASS to %s (ifindex=%u). Ctrl-C to stop.\n",
             argv[1], ifindex);
     while (!stopping) {
+        ipc_poll(&ipc);
         error = ring_buffer__poll(ring, 100);
         if (error == -EINTR) {
             error = 0;
@@ -95,6 +105,7 @@ int main(int argc, char **argv)
     }
 
 cleanup:
+    ipc_close(&ipc);
     if (link) {
         int detach_error = bpf_link__destroy(link);
 

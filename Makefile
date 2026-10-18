@@ -11,7 +11,7 @@ CFLAGS ?= -O2 -g
 LIBBPF_CFLAGS := $(shell $(PKG_CONFIG) --cflags libbpf)
 LIBBPF_LIBS := $(shell $(PKG_CONFIG) --libs libbpf)
 
-.PHONY: all ebpf clean test
+.PHONY: all ebpf clean test test-m2 test-m3
 
 all: $(AGENT)
 
@@ -27,11 +27,20 @@ $(BPF_SKEL): $(BPF_OBJ)
 	$(BPFTOOL) gen skeleton $< > $@.tmp
 	mv $@.tmp $@
 
-$(AGENT): agent/main.c ebpf/include/event.h $(BPF_SKEL)
-	$(CC) $(CPPFLAGS) $(CFLAGS) -Wall -Wextra -Werror $(LIBBPF_CFLAGS) -Iebpf/include -Ibuild $< -o $@ $(LDFLAGS) $(LIBBPF_LIBS)
+$(AGENT): agent/main.c agent/ipc.c agent/ipc.h ebpf/include/event.h $(BPF_SKEL)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -Wall -Wextra -Werror $(LIBBPF_CFLAGS) -Iebpf/include -Ibuild agent/main.c agent/ipc.c -o $@ $(LDFLAGS) $(LIBBPF_LIBS)
 
-test: all
+build/ipc-driver: tests/ipc_driver.c agent/ipc.c agent/ipc.h ebpf/include/event.h | build
+	$(CC) $(CPPFLAGS) $(CFLAGS) -Wall -Wextra -Werror -Iagent -Iebpf/include tests/ipc_driver.c agent/ipc.c -o $@ $(LDFLAGS)
+
+test: all build/ipc-driver
+	PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -p 'test_*.py' -v
+
+test-m2: all
 	bash tests/m2_pipeline.sh
+
+test-m3: all
+	KERNELLENS_TEST_M3=1 bash tests/m2_pipeline.sh
 
 clean:
 	rm -rf build

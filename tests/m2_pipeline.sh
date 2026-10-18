@@ -4,7 +4,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 if [[ ${1:-} != --isolated ]]; then
     if [[ $EUID != 0 ]]; then
-        echo 'Run sudo make test (requires BPF and network administration privileges).' >&2
+        echo 'Run sudo make test-m2 or sudo make test-m3 (requires BPF and network administration privileges).' >&2
         exit 1
     fi
     exec unshare --net bash "$0" --isolated
@@ -13,7 +13,12 @@ fi
 test_dir=$(mktemp -d)
 agent_pid=
 sender_pid=
+receiver_pid=
 cleanup() {
+    if [[ -n $receiver_pid ]]; then
+        kill -TERM "$receiver_pid" 2>/dev/null || true
+        wait "$receiver_pid" 2>/dev/null || true
+    fi
     if [[ -n $agent_pid ]]; then
         kill -TERM "$agent_pid" 2>/dev/null || true
         wait "$agent_pid" 2>/dev/null || true
@@ -43,7 +48,11 @@ ip address add 192.0.2.2/24 dev kl-recv
 ip link set kl-recv up
 expected_ifindex=$(ip -o link show kl-recv | awk -F': ' '{print $1}')
 
-./build/kernellens-agent kl-recv >"$test_dir/events" 2>"$test_dir/agent.log" &
+ipc_arguments=()
+if [[ ${KERNELLENS_TEST_M3:-0} == 1 ]]; then
+    ipc_arguments=("$test_dir/agent.sock")
+fi
+./build/kernellens-agent kl-recv "${ipc_arguments[@]}" >"$test_dir/events" 2>"$test_dir/agent.log" &
 agent_pid=$!
 for ((attempt=0; attempt<100; attempt++)); do
     if grep -q 'Attached XDP_PASS' "$test_dir/agent.log"; then
@@ -56,6 +65,15 @@ for ((attempt=0; attempt<100; attempt++)); do
     sleep 0.05
 done
 grep -q 'Attached XDP_PASS' "$test_dir/agent.log"
+if [[ ${KERNELLENS_TEST_M3:-0} == 1 ]]; then
+    timeout 15 python3 backend/receiver.py "$test_dir/agent.sock" >"$test_dir/python.events" 2>"$test_dir/python.log" &
+    receiver_pid=$!
+    for ((attempt=0; attempt<100; attempt++)); do
+        grep -q 'Agent status: ready' "$test_dir/python.log" && break
+        sleep 0.05
+    done
+    grep -q 'Agent status: ready' "$test_dir/python.log"
+fi
 
 # A second instance must fail without replacing the first instance's program.
 if timeout --signal=TERM 3 ./build/kernellens-agent kl-recv >"$test_dir/second.out" 2>"$test_dir/second.log"; then
@@ -83,6 +101,25 @@ awk -v idx="$expected_ifindex" '
     END { exit !found }
 ' "$test_dir/events"
 grep -q 'Detached XDP' "$test_dir/agent.log"
+if [[ ${KERNELLENS_TEST_M3:-0} == 1 ]]; then
+    wait "$receiver_pid"
+    receiver_pid=
+    test ! -e "$test_dir/agent.sock"
+    python3 - "$test_dir/python.events" "$expected_ifindex" <<'PY'
+import json
+import sys
+from backend.receiver import validate_message
+
+with open(sys.argv[1]) as stream:
+    messages = [validate_message(json.loads(line)) for line in stream]
+assert any(message["event"]["ifindex"] == int(sys.argv[2])
+           and message["event"]["timestamp"] > 0
+           and message["event"]["packet_length"] == 98 for message in messages)
+print("PASS: eBPF → C agent → Unix socket → validated Python event")
+for message in messages:
+    print(json.dumps(message))
+PY
+fi
 if ip -details link show kl-recv | grep -q 'prog/xdp'; then
     echo 'FAIL: XDP remains attached' >&2
     exit 1
