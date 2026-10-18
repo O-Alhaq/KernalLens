@@ -4,7 +4,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 if [[ ${1:-} != --isolated ]]; then
     if [[ $EUID != 0 ]]; then
-        echo 'Run sudo make test-m2 or sudo make test-m3 (requires BPF and network administration privileges).' >&2
+        echo 'Run sudo make test-m2, test-m3, or test-m4 (requires BPF and network administration privileges).' >&2
         exit 1
     fi
     exec unshare --net bash "$0" --isolated
@@ -14,7 +14,12 @@ test_dir=$(mktemp -d)
 agent_pid=
 sender_pid=
 receiver_pid=
+traffic_pid=
 cleanup() {
+    if [[ -n $traffic_pid ]]; then
+        kill -TERM "$traffic_pid" 2>/dev/null || true
+        wait "$traffic_pid" 2>/dev/null || true
+    fi
     if [[ -n $receiver_pid ]]; then
         kill -TERM "$receiver_pid" 2>/dev/null || true
         wait "$receiver_pid" 2>/dev/null || true
@@ -66,7 +71,7 @@ for ((attempt=0; attempt<100; attempt++)); do
 done
 grep -q 'Attached XDP_PASS' "$test_dir/agent.log"
 if [[ ${KERNELLENS_TEST_M3:-0} == 1 ]]; then
-    timeout 15 python3 backend/receiver.py "$test_dir/agent.sock" >"$test_dir/python.events" 2>"$test_dir/python.log" &
+    timeout 45 python3 backend/receiver.py "$test_dir/agent.sock" >"$test_dir/python.events" 2>"$test_dir/python.log" &
     receiver_pid=$!
     for ((attempt=0; attempt<100; attempt++)); do
         grep -q 'Agent status: ready' "$test_dir/python.log" && break
@@ -82,6 +87,23 @@ if timeout --signal=TERM 3 ./build/kernellens-agent kl-recv >"$test_dir/second.o
 fi
 grep -q 'Cannot attach XDP' "$test_dir/second.log"
 nsenter -t "$sender_pid" -n ping -I kl-send -c 3 -W 2 192.0.2.2
+if [[ ${KERNELLENS_TEST_M4:-0} == 1 ]]; then
+    python3 tests/network_traffic.py server --ready "$test_dir/traffic-ready" >"$test_dir/traffic.log" 2>&1 &
+    traffic_pid=$!
+    for ((attempt=0; attempt<100; attempt++)); do
+        [[ -e $test_dir/traffic-ready ]] && break
+        sleep 0.05
+    done
+    test -e "$test_dir/traffic-ready"
+    nsenter -t "$sender_pid" -n python3 tests/network_traffic.py client
+    wait "$traffic_pid"
+    traffic_pid=
+    for ((attempt=0; attempt<100; attempt++)); do
+        python3 tests/check_network_events.py "$test_dir/python.events" "$expected_ifindex" --quiet && break
+        sleep 0.05
+    done
+    python3 tests/check_network_events.py "$test_dir/python.events" "$expected_ifindex"
+fi
 for ((attempt=0; attempt<100; attempt++)); do
     if grep -q 'packet_length=98$' "$test_dir/events"; then
         break
@@ -101,6 +123,9 @@ awk -v idx="$expected_ifindex" '
     END { exit !found }
 ' "$test_dir/events"
 grep -q 'Detached XDP' "$test_dir/agent.log"
+if [[ ${KERNELLENS_TEST_M4:-0} == 1 ]]; then
+    grep -Eq 'Telemetry: packets=[1-9][0-9]* bytes=[1-9][0-9]* ipv4=[1-9][0-9]* tcp=[1-9][0-9]* udp=[1-9][0-9]*' "$test_dir/agent.log"
+fi
 if [[ ${KERNELLENS_TEST_M3:-0} == 1 ]]; then
     wait "$receiver_pid"
     receiver_pid=
@@ -139,4 +164,10 @@ kill -TERM "$agent_pid"
 wait "$agent_pid"
 agent_pid=
 grep -q 'Detached XDP' "$test_dir/restart.log"
+ip link delete kl-recv
+if ip link show kl-recv >/dev/null 2>&1 || nsenter -t "$sender_pid" -n ip link show kl-send >/dev/null 2>&1; then
+    echo 'FAIL: temporary veth networking remains' >&2
+    exit 1
+fi
+echo 'PASS: temporary veth pair removed; namespace processes cleaned up on exit'
 echo 'PASS: packet events, XDP_PASS delivery, attachment conflict, SIGINT/SIGTERM cleanup, reattach'

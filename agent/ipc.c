@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 #include "ipc.h"
 
+#include <arpa/inet.h>
 #include <errno.h>
 #include <inttypes.h>
 #include <stdio.h>
@@ -106,15 +107,32 @@ void ipc_poll(struct ipc_server *server)
 
 void ipc_publish(struct ipc_server *server, const struct packet_event *event)
 {
-    char record[256];
+    char record[512];
+    char source[INET_ADDRSTRLEN], destination[INET_ADDRSTRLEN], protocol[16];
     int length;
 
+    if (!inet_ntop(AF_INET, &event->src_ip, source, sizeof(source)) ||
+        !inet_ntop(AF_INET, &event->dst_ip, destination, sizeof(destination)))
+        return;
+    if (event->ip_version != 4)
+        strcpy(protocol, "OTHER");
+    else if (event->protocol == IPPROTO_TCP)
+        strcpy(protocol, "TCP");
+    else if (event->protocol == IPPROTO_UDP)
+        strcpy(protocol, "UDP");
+    else if (event->protocol == IPPROTO_ICMP)
+        strcpy(protocol, "ICMP");
+    else
+        snprintf(protocol, sizeof(protocol), "IPPROTO_%u", event->protocol);
     length = snprintf(record, sizeof(record),
         "{\"message_type\":\"event\",\"schema_version\":1,\"event\":{"
         "\"timestamp\":%" PRIu64 ",\"ifindex\":%" PRIu32
-        ",\"packet_length\":%" PRIu32 "}}\n",
+        ",\"packet_length\":%" PRIu32
+        ",\"src_ip\":\"%s\",\"dst_ip\":\"%s\",\"src_port\":%u,\"dst_port\":%u"
+        ",\"protocol\":\"%s\",\"tcp_flags\":%u}}\n",
         (uint64_t)event->timestamp, (uint32_t)event->ifindex,
-        (uint32_t)event->packet_length);
+        (uint32_t)event->packet_length, source, destination,
+        event->src_port, event->dst_port, protocol, event->tcp_flags);
     if (length > 0 && (size_t)length < sizeof(record))
         send_record(server, record, (size_t)length);
 }

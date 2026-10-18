@@ -3,14 +3,47 @@
 #include <net/if.h>
 #include <signal.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <bpf/libbpf.h>
+#include <bpf/bpf.h>
 
 #include "event.h"
 #include "ipc.h"
 #include "xdp_test.skel.h"
 
 static volatile sig_atomic_t stopping;
+
+static void print_counters(struct xdp_test_bpf *skeleton)
+{
+    struct telemetry_counters total = {}, *values;
+    int cpus = libbpf_num_possible_cpus();
+    __u32 key = 0;
+
+    if (cpus <= 0)
+        return;
+    values = calloc((size_t)cpus, sizeof(*values));
+    if (!values)
+        return;
+    if (bpf_map_lookup_elem(bpf_map__fd(skeleton->maps.counters), &key, values)) {
+        fprintf(stderr, "Cannot read telemetry counters: %s\n", strerror(errno));
+        free(values);
+        return;
+    }
+    for (int i = 0; i < cpus; i++) {
+        total.packets += values[i].packets;
+        total.bytes += values[i].bytes;
+        total.ipv4 += values[i].ipv4;
+        total.tcp += values[i].tcp;
+        total.udp += values[i].udp;
+        total.malformed += values[i].malformed;
+        total.ringbuf_dropped += values[i].ringbuf_dropped;
+    }
+    fprintf(stderr, "Telemetry: packets=%llu bytes=%llu ipv4=%llu tcp=%llu udp=%llu malformed=%llu ringbuf_dropped=%llu\n",
+            total.packets, total.bytes, total.ipv4, total.tcp, total.udp,
+            total.malformed, total.ringbuf_dropped);
+    free(values);
+}
 
 static void stop(int signal_number)
 {
@@ -115,6 +148,7 @@ cleanup:
         } else {
             fprintf(stderr, "Detached XDP from %s.\n", argv[1]);
         }
+        print_counters(skeleton);
     }
     ring_buffer__free(ring);
     xdp_test_bpf__destroy(skeleton);

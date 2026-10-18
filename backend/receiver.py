@@ -1,6 +1,7 @@
-"""M3 Unix socket receiver: framing, validation, and terminal output only."""
+"""Unix socket receiver for validated M4 network telemetry."""
 
 import argparse
+import ipaddress
 import json
 import socket
 import sys
@@ -20,15 +21,38 @@ def validate_message(message):
     if message.get("message_type") != "event" or set(message) != {"message_type", "schema_version", "event"}:
         raise ValueError("invalid event envelope")
     event = message["event"]
-    if not isinstance(event, dict) or set(event) != {"timestamp", "ifindex", "packet_length"}:
+    if not isinstance(event, dict) or set(event) != {
+        "timestamp", "ifindex", "packet_length", "src_ip", "dst_ip",
+        "src_port", "dst_port", "protocol", "tcp_flags",
+    }:
         raise ValueError("invalid event fields")
     for field, maximum, minimum in (
         ("timestamp", (1 << 64) - 1, 0),
         ("ifindex", (1 << 32) - 1, 1),
         ("packet_length", (1 << 32) - 1, 0),
+        ("src_port", 65535, 0),
+        ("dst_port", 65535, 0),
+        ("tcp_flags", 255, 0),
     ):
         if type(event[field]) is not int or not minimum <= event[field] <= maximum:
             raise ValueError(f"invalid {field}")
+    for field in ("src_ip", "dst_ip"):
+        if not isinstance(event[field], str):
+            raise ValueError(f"invalid {field}")
+        ipaddress.IPv4Address(event[field])
+    protocol = event["protocol"]
+    if not isinstance(protocol, str):
+        raise ValueError("invalid protocol")
+    if protocol not in {"TCP", "UDP", "ICMP", "OTHER"}:
+        number = protocol.removeprefix("IPPROTO_")
+        if not number.isascii() or not number.isdecimal() or not 0 <= int(number) <= 255 or protocol != f"IPPROTO_{int(number)}" or int(number) in {1, 6, 17}:
+            raise ValueError("invalid protocol")
+    if protocol != "TCP" and event["tcp_flags"] != 0:
+        raise ValueError("TCP flags only apply to TCP")
+    if protocol not in {"TCP", "UDP"} and (event["src_port"] or event["dst_port"]):
+        raise ValueError("ports only apply to TCP/UDP")
+    if protocol == "OTHER" and (event["src_ip"] != "0.0.0.0" or event["dst_ip"] != "0.0.0.0"):
+        raise ValueError("unsupported Ethernet must have zero addresses")
     return message
 
 

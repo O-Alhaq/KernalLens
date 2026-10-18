@@ -11,7 +11,9 @@ from backend.receiver import receive_messages, validate_message
 
 ROOT = Path(__file__).resolve().parents[1]
 EVENT = {"message_type": "event", "schema_version": 1,
-         "event": {"timestamp": 123456789, "ifindex": 2, "packet_length": 86}}
+         "event": {"timestamp": 123456789, "ifindex": 2, "packet_length": 86,
+                   "src_ip": "192.0.2.1", "dst_ip": "192.0.2.2",
+                   "src_port": 45678, "dst_port": 80, "protocol": "TCP", "tcp_flags": 2}}
 STATUS = {"message_type": "status", "schema_version": 1, "status": "ready"}
 
 
@@ -39,6 +41,11 @@ class ValidationTests(unittest.TestCase):
                 message["event"][field] = bad
                 with self.subTest(field=field, bad=bad), self.assertRaises(ValueError):
                     validate_message(message)
+            if field in {"src_port", "dst_port", "tcp_flags"}:
+                message = copy.deepcopy(EVENT)
+                message["event"][field] = 65536 if field != "tcp_flags" else 256
+                with self.assertRaises(ValueError):
+                    validate_message(message)
             message = copy.deepcopy(EVENT)
             del message["event"][field]
             with self.assertRaises(ValueError):
@@ -50,6 +57,29 @@ class ValidationTests(unittest.TestCase):
                     {**STATUS, "status": "other"}):
             with self.subTest(message=bad), self.assertRaises(ValueError):
                 validate_message(bad)
+
+    def test_protocol_defaults_and_invalid_network_fields(self):
+        for protocol in ("UDP", "ICMP", "OTHER", "IPPROTO_47"):
+            message = copy.deepcopy(EVENT)
+            message["event"].update(protocol=protocol, tcp_flags=0, src_port=0, dst_port=0)
+            if protocol == "OTHER":
+                message["event"].update(src_ip="0.0.0.0", dst_ip="0.0.0.0")
+            validate_message(message)
+        for field, values in {
+            "src_ip": ("::1", "999.0.0.1", "192.0.2.01"),
+            "dst_ip": ("invalid", "::ffff:192.0.2.1"),
+            "protocol": ("", "SCTP", "IPPROTO_256", "IPPROTO_06", "IPPROTO_6"),
+        }.items():
+            for value in values:
+                message = copy.deepcopy(EVENT)
+                message["event"][field] = value
+                with self.subTest(field=field, value=value), self.assertRaises(ValueError):
+                    validate_message(message)
+        for protocol in ("UDP", "ICMP", "OTHER"):
+            message = copy.deepcopy(EVENT)
+            message["event"]["protocol"] = protocol
+            with self.assertRaises(ValueError):
+                validate_message(message)
 
     def test_stream_fragmentation_and_multiple_records(self):
         wire = (json.dumps(STATUS) + "\n" + json.dumps(EVENT) + "\n").encode()
