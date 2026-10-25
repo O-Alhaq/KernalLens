@@ -7,6 +7,7 @@ import unittest
 from check_host_events import check
 from test_host import host_message
 from test_ipc import EVENT
+from backend.events import normalize_message
 
 
 class HostCaptureTests(unittest.TestCase):
@@ -30,9 +31,9 @@ class HostCaptureTests(unittest.TestCase):
                        copy.deepcopy(uid_call), {**uid_call, "syscall_return": -1}]
 
     def write(self, events):
-        self.path.write_text(json.dumps(EVENT) + "\n" + "".join(json.dumps({
+        self.path.write_text(json.dumps(normalize_message(EVENT).to_dict()) + "\n" + "".join(json.dumps(normalize_message({
             "message_type": "event", "schema_version": 1, "event": event,
-        }) + "\n" for event in events))
+        }).to_dict()) + "\n" for event in events))
 
     def test_capture_with_network_and_all_host_categories(self):
         self.write(self.events)

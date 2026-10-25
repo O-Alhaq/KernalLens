@@ -5,6 +5,7 @@ import subprocess
 import unittest
 
 from backend.receiver import validate_message
+from backend.events import SecurityEvent, normalize_message
 import test_ipc
 
 
@@ -126,9 +127,13 @@ class HostTransportTests(unittest.TestCase):
             self.stop_driver()
             output, errors = receiver.communicate(timeout=3)
             self.assertEqual(receiver.returncode, 0, errors)
-            messages = [validate_message(json.loads(line)) for line in output.splitlines()]
-            self.assertEqual(messages, [host_message(category) for category in
-                                       ("process", "syscall", "privilege")] + [test_ipc.EVENT])
+            messages = [SecurityEvent.from_dict(json.loads(line)).to_dict() for line in output.splitlines()]
+            expected = [normalize_message(message).to_dict() for message in
+                        [host_message(category) for category in
+                         ("process", "syscall", "privilege")] + [test_ipc.EVENT]]
+            for event in messages + expected:
+                event.pop("event_id")
+            self.assertEqual(messages, expected)
         finally:
             if receiver.poll() is None:
                 receiver.kill()

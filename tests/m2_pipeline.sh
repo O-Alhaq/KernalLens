@@ -171,13 +171,13 @@ if [[ ${KERNELLENS_TEST_M3:-0} == 1 ]]; then
     python3 - "$test_dir/python.events" "$expected_ifindex" <<'PY'
 import json
 import sys
-from backend.receiver import validate_message
+from backend.events import SecurityEvent
 
 with open(sys.argv[1]) as stream:
-    messages = [validate_message(json.loads(line)) for line in stream]
-assert any(message["event"].get("ifindex") == int(sys.argv[2])
-           and message["event"]["timestamp"] > 0
-           and message["event"]["packet_length"] == 98 for message in messages)
+    messages = [SecurityEvent.from_dict(json.loads(line)).to_dict() for line in stream]
+assert any(message.get("interface") == int(sys.argv[2])
+           and message["timestamp"] > 0
+           and message["metadata"]["packet_length"] == 98 for message in messages)
 print("PASS: eBPF → C agent → Unix socket → validated Python event")
 for message in messages:
     print(json.dumps(message))

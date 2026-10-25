@@ -8,6 +8,7 @@ import tempfile
 import unittest
 
 from backend.receiver import receive_messages, validate_message
+from backend.events import SecurityEvent, normalize_message
 
 ROOT = Path(__file__).resolve().parents[1]
 EVENT = {"message_type": "event", "schema_version": 1,
@@ -196,7 +197,11 @@ class TransportTests(unittest.TestCase):
             output, errors = receiver.communicate(timeout=3)
             self.assertEqual(receiver.returncode, 0, errors)
             self.assertIn("Agent status: ready", errors)
-            self.assertEqual(json.loads(output), EVENT)
+            actual = SecurityEvent.from_dict(json.loads(output)).to_dict()
+            expected = normalize_message(EVENT).to_dict()
+            actual.pop("event_id")
+            expected.pop("event_id")
+            self.assertEqual(actual, expected)
         finally:
             if receiver.poll() is None:
                 receiver.kill()

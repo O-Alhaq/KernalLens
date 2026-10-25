@@ -3,19 +3,19 @@
 KernelLens is a real-time eBPF-based telemetry framework for hybrid host and network threat detection.
 
 ## Current Milestone
-M5 - Host Telemetry
+M6 - Unified Event Pipeline
 
 The C XDP program sends packet events through a BPF ring buffer to a C
 libbpf agent. Every packet returns `XDP_PASS`, including when the ring buffer
 is full (in that case the event is skipped). The program parses Ethernet, IPv4,
 TCP, and UDP headers for telemetry. The agent serves a Python receiver over a Unix domain socket.
-Python only validates and prints messages; no detection or later milestone
-functionality is included.
+Python validates and normalizes all telemetry into `SecurityEvent` objects,
+routes them to subscribers, and prints the unified model as JSON. No later
+milestone functionality is included.
 
 Host telemetry is opt-in. The network-only invocation below remains unchanged;
 add `--host` to collect process, syscall, and privilege records alongside packets.
-This milestone keeps separate network and host record formats rather than
-introducing the later unified event model.
+The C wire formats remain unchanged; normalization happens entirely in Python.
 
 Prerequisites: Linux with BTF, BPF ring buffers and XDP BPF-link support,
 Clang/LLVM with the BPF target, libbpf development headers, bpftool, pkg-config,
@@ -110,15 +110,16 @@ filename bytes safely.
 
 The agent dispatches the two distinct binary record sizes and the host kind
 discriminator. Network JSON is unchanged. The Python receiver validates each
-category's fields and prints the full envelope. Host entry/exit matching uses
+category's fields before normalization. Host entry/exit matching uses
 a bounded 4096-entry per-thread map, removed on completion/thread exit. A full
 map or ring buffer may omit telemetry; there is no replay. This state only
 pairs monitored syscall entries/exits and is not process lineage. Closing the
 agent destroys its unpinned tracepoint links and maps on normal exit or failure.
 
 The socket is accessible only to its owner (root in this example). The agent
-continues printing M2 terminal events. The Python receiver prints validated
-event envelopes as JSON to stdout and connection status to stderr:
+continues printing M2 terminal events. The agent sends network event envelopes over the socket (shown below). The
+Python receiver prints normalized SecurityEvent JSON to stdout and connection
+status to stderr:
 
 ```json
 {"message_type":"event","schema_version":1,"event":{"timestamp":123456789,"ifindex":2,"packet_length":74,"src_ip":"192.0.2.1","dst_ip":"192.0.2.2","src_port":45678,"dst_port":80,"protocol":"TCP","tcp_flags":2}}
@@ -163,6 +164,56 @@ Ctrl-C/SIGTERM on the agent detaches XDP, closes the connection, and removes its
 socket file. Existing socket paths are never overwritten. After an ungraceful
 exit, manually remove a stale socket only after confirming its agent has exited.
 The runtime directory is left in place.
+
+## Unified Python event pipeline (M6)
+
+`backend/events.py` defines the shared standard-library dataclass `SecurityEvent`.
+All fields from specification section 7 are serialized, including null fields.
+Every normalization assigns a new UUID4 `event_id`, and preserves the original
+uint64 monotonic nanosecond `timestamp` without converting it to wall time.
+Container and cgroup identity are null because the current sensors do not supply them.
+
+| Input | Category / type | Source | Metadata |
+| --- | --- | --- | --- |
+| M4 packet | network / network_packet | xdp | packet_length |
+| M5 exec | process / process_exec | tracepoint | empty object |
+| M5 syscall | syscall / syscall_event | tracepoint | syscall_return |
+| M5 credential change | privilege / privilege_change | tracepoint | syscall_return, previous_uid, previous_gid |
+
+Network `ifindex` becomes `interface`. Network events have null host fields;
+host events have null network fields. Network zero ports/flags and `OTHER`
+addresses retain the M4 parser defaults, including partially parsed packets.
+Host names, paths, syscall names, IDs, and credentials retain M5 semantics.
+
+`backend/validation.py` retains strict wire validation. The receiver re-exports
+`validate_message` and `receive_messages` for existing wire consumers.
+`normalize_message` accepts only validated event envelopes; status messages are
+handled separately. `SecurityEvent.from_dict` validates the complete unified
+schema, UUID, source/type/category, applicable fields, ranges, and metadata
+semantics using the same sensor constraints. Unsupported or malformed input
+raises `ValueError`; the CLI reports the error to stderr and exits nonzero.
+
+`backend.pipeline.receive_events(connection, on_status=...)` yields only
+`SecurityEvent` objects. `EventRouter.subscribe(consumer, category=None)` registers
+synchronous subscribers for all events or a single category. `route(event)`
+validates the model and delivers it to matching consumers without exposing the
+wire format. Subscriber failures propagate to the caller; there is no queue,
+retry, persistence, or replay. For example:
+
+```python
+from backend.pipeline import EventRouter, receive_events
+
+router = EventRouter()
+router.subscribe(lambda event: print(event.to_dict()))
+for event in receive_events(connection):
+    router.route(event)
+```
+
+The CLI's stdout changed from raw envelopes to one complete unified event per
+line. Agent JSON and Unix socket framing remain at schema version 1. The
+privileged regression checkers validate the new stdout schema before checking
+packet endpoints and controlled host activity. No storage, API, detection,
+alerting, correlation, response, or frontend is implemented in M6.
 
 Run non-privileged parser, validation and real C-to-Python socket tests:
 

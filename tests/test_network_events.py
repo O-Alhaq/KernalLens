@@ -7,6 +7,7 @@ import tempfile
 import unittest
 
 from check_network_events import check
+from backend.events import normalize_message
 
 
 class NetworkCaptureTests(unittest.TestCase):
@@ -24,9 +25,9 @@ class NetworkCaptureTests(unittest.TestCase):
                         "protocol": "UDP", "tcp_flags": 0, "packet_length": 56}]
 
     def write_events(self, events):
-        self.path.write_text("".join(json.dumps({
+        self.path.write_text("".join(json.dumps(normalize_message({
             "message_type": "event", "schema_version": 1, "event": event,
-        }) + "\n" for event in events))
+        }).to_dict()) + "\n" for event in events))
 
     def test_expected_capture(self):
         self.write_events(self.events)

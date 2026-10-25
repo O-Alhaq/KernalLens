@@ -7,13 +7,13 @@ import sys
 
 # Also support direct invocation from the repository root.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from backend.receiver import validate_message
+from backend.events import SecurityEvent
 
 
 def check(path, ifindex):
     with open(path) as stream:
-        events = [validate_message(json.loads(line))["event"] for line in stream]
-    matching = [event for event in events if event.get("ifindex") == ifindex
+        events = [SecurityEvent.from_dict(json.loads(line)).to_dict() for line in stream]
+    matching = [event for event in events if event.get("interface") == ifindex
                 and event["timestamp"] > 0 and event["src_ip"] == "192.0.2.1"
                 and event["dst_ip"] == "192.0.2.2"]
     tcp = [event for event in matching if event["protocol"] == "TCP"
@@ -22,7 +22,7 @@ def check(path, ifindex):
            and event["src_port"] == 45001 and event["dst_port"] == 32081]
     assert any(event["tcp_flags"] == 2 for event in tcp), "missing TCP SYN with exact endpoints"
     assert any(event["tcp_flags"] & 0x18 == 0x18 for event in tcp), "missing TCP PSH/ACK"
-    assert any(event["tcp_flags"] == 0 and event["packet_length"] == 42 + len(b"kernellens-udp") for event in udp), "missing UDP datagram"
+    assert any(event["tcp_flags"] == 0 and event["metadata"]["packet_length"] == 42 + len(b"kernellens-udp") for event in udp), "missing UDP datagram"
     return tcp + udp
 
 
