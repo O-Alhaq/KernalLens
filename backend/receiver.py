@@ -3,12 +3,15 @@
 import argparse
 import json
 import socket
+import sqlite3
 import sys
 
 if __package__:
+    from .storage import EventStore
     from .validation import validate_host_event, validate_message
     from .pipeline import EventRouter, receive_events
 else:
+    from storage import EventStore
     from validation import validate_host_event, validate_message
     from pipeline import EventRouter, receive_events
 
@@ -47,11 +50,18 @@ def receive_messages(connection):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("socket_path", help="Unix socket exposed by the C agent")
+    parser.add_argument("--database", help="persist normalized events to this SQLite file")
     arguments = parser.parse_args()
     try:
+        store = None
+        if arguments.database:
+            store = EventStore(arguments.database)
+            store.initialize()
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
             connection.connect(arguments.socket_path)
             router = EventRouter()
+            if store is not None:
+                router.subscribe(store.insert)
             router.subscribe(lambda event: print(
                 json.dumps(event.to_dict(), separators=(",", ":")), flush=True))
             for event in receive_events(connection, on_status=lambda message: print(
@@ -59,7 +69,7 @@ def main():
                 router.route(event)
     except KeyboardInterrupt:
         return 0
-    except (OSError, ValueError) as error:
+    except (OSError, ValueError, sqlite3.Error) as error:
         print(f"Receiver error: {error}", file=sys.stderr)
         return 1
     return 0

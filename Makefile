@@ -7,6 +7,7 @@ AGENT := build/kernellens-agent
 CLANG ?= clang
 BPFTOOL ?= bpftool
 PKG_CONFIG ?= pkg-config
+PYTHON ?= python3
 
 BPF_CFLAGS := -O2 -g -target bpf -Wall -Werror -isystem ebpf/include
 CFLAGS ?= -O2 -g
@@ -47,7 +48,7 @@ build/packet-parser-test: tests/packet_parser.c ebpf/include/packet_parser.h ebp
 
 test: all build/ipc-driver build/packet-parser-test
 	./build/packet-parser-test
-	PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -p 'test_*.py' -v
+	PYTHONDONTWRITEBYTECODE=1 $(PYTHON) -m unittest discover -s tests -p 'test_*.py' -v
 
 test-m2: all
 	bash tests/m2_pipeline.sh

@@ -3,15 +3,15 @@
 KernelLens is a real-time eBPF-based telemetry framework for hybrid host and network threat detection.
 
 ## Current Milestone
-M6 - Unified Event Pipeline
+M7 - Persistence and API Foundation
 
 The C XDP program sends packet events through a BPF ring buffer to a C
 libbpf agent. Every packet returns `XDP_PASS`, including when the ring buffer
 is full (in that case the event is skipped). The program parses Ethernet, IPv4,
 TCP, and UDP headers for telemetry. The agent serves a Python receiver over a Unix domain socket.
 Python validates and normalizes all telemetry into `SecurityEvent` objects,
-routes them to subscribers, and prints the unified model as JSON. No later
-milestone functionality is included.
+routes them to subscribers, and prints the unified model as JSON. Optional SQLite
+persistence and a read-only FastAPI REST API provide the M7 foundation.
 
 Host telemetry is opt-in. The network-only invocation below remains unchanged;
 add `--host` to collect process, syscall, and privilege records alongside packets.
@@ -19,7 +19,8 @@ The C wire formats remain unchanged; normalization happens entirely in Python.
 
 Prerequisites: Linux with BTF, BPF ring buffers and XDP BPF-link support,
 Clang/LLVM with the BPF target, libbpf development headers, bpftool, pkg-config,
-Make, a C compiler, and Python 3 (standard library only). The existing
+Make, a C compiler, and Python 3. The collection/normalization/storage path uses
+the standard library; the API additionally requires FastAPI and Uvicorn. The existing
 `ebpf/include/vmlinux.h` supplies kernel
 types for the CO-RE build; the target kernel must expose BTF.
 
@@ -212,13 +213,86 @@ for event in receive_events(connection):
 The CLI's stdout changed from raw envelopes to one complete unified event per
 line. Agent JSON and Unix socket framing remain at schema version 1. The
 privileged regression checkers validate the new stdout schema before checking
-packet endpoints and controlled host activity. No storage, API, detection,
-alerting, correlation, response, or frontend is implemented in M6.
+packet endpoints and controlled host activity. M6 remains the normalization boundary. M7 adds optional storage/API below;
+no detection, alerting, correlation, response, or frontend is implemented.
+
+## SQLite persistence and REST API (M7)
+
+Install the runtime dependencies in a virtual environment (add HTTPX for tests):
+
+```bash
+python3 -m venv .venv
+.venv/bin/python -m pip install -r requirements-dev.txt
+# For runtime only, use requirements.txt instead.
+```
+
+The original receiver command still prints normalized events without storage.
+To also persist them, pass `--database` with a file path. Its parent directory
+must already exist. Start the agent as described above, then run:
+
+```bash
+sudo .venv/bin/python backend/receiver.py /run/kernellens/events.sock --database /var/lib/kernellens/events.db
+```
+
+Create `/var/lib/kernellens` first when using that example. Run the API in a
+separate process with filesystem access to the same database and its directory:
+
+```bash
+KERNELLENS_DATABASE=/var/lib/kernellens/events.db .venv/bin/uvicorn backend.api:app --host 127.0.0.1 --port 8000
+```
+
+`KERNELLENS_DATABASE` defaults to `kernellens.db` in the API working directory.
+The receiver stores only when `--database` is explicitly supplied. Use matching
+absolute paths so both processes share the same file. API startup initializes
+its database; importing the app does not create a file. The API does not connect
+to the agent or start a second collector. `/health` reports API/database access,
+not sensor connectivity.
+
+```bash
+curl http://127.0.0.1:8000/health
+curl 'http://127.0.0.1:8000/events?limit=20&offset=0&event_category=network'
+curl 'http://127.0.0.1:8000/events?event_type=process_exec'
+curl http://127.0.0.1:8000/events/EVENT_UUID
+```
+
+`GET /health` returns `{"status":"ok","database":"ok"}` after checking
+schema/table access. `GET /events` returns a JSON array of complete M6 records,
+including null fields and decoded metadata. It defaults to `limit=100` and
+`offset=0`; limit is 1–1000, offset is non-negative. Results are in insertion
+order, oldest first. Optional `event_category` and `event_type` filters are exact
+matches combined with AND. Unknown filters yield an empty array. Pagination
+operates on matching events; invalid parameters return 422. Missing event IDs
+return 404. Database operation failures return 503 without database details.
+There are no event-write API endpoints.
+
+`backend/storage.py` implements file-backed `EventStore` using standard
+`sqlite3`. `initialize()` creates schema version 1 transactionally using
+`PRAGMA user_version`, preserves existing records on repeat startup, and rejects
+unknown versions. Future migrations can extend this versioned initialization;
+there is no schema reset. One `events` table contains every SecurityEvent field,
+with indexes on category/type, a unique primary-key event ID, and JSON text
+metadata. Timestamp uses decimal TEXT because SQLite INTEGER cannot represent
+the full sensor uint64 range; reads restore the original integer. API responses
+therefore retain the M6 JSON types and values. Container/cgroup fields retain
+the current M6 null constraints.
+
+Each store operation closes its own connection; writes commit before returning.
+WAL mode and a five-second lock timeout allow the receiver and API to share a
+local database. Persistence is synchronous: storage errors propagate, the receiver
+reports them and exits nonzero, and there is no buffering/retry/replay. Duplicate
+IDs fail without overwriting records. Store reads and writes validate against
+the existing SecurityEvent model. Normalization has no database dependency.
+Any future Python consumer can register persistence with
+`router.subscribe(store.insert)` after initializing its store.
+
+Tests use temporary SQLite files and include a real C IPC driver → receiver →
+SQLite → REST round trip for network, process, syscall, and privilege telemetry.
+No real project database is used by the tests.
 
 Run non-privileged parser, validation and real C-to-Python socket tests:
 
 ```bash
-make test
+make test PYTHON=.venv/bin/python
 ```
 
 Run the privileged integration tests after building:
