@@ -3,7 +3,7 @@
 KernelLens is a real-time eBPF-based telemetry framework for hybrid host and network threat detection.
 
 ## Current Milestone
-M7 - Persistence and API Foundation
+M8 - Rule Engine
 
 The C XDP program sends packet events through a BPF ring buffer to a C
 libbpf agent. Every packet returns `XDP_PASS`, including when the ring buffer
@@ -11,7 +11,8 @@ is full (in that case the event is skipped). The program parses Ethernet, IPv4,
 TCP, and UDP headers for telemetry. The agent serves a Python receiver over a Unix domain socket.
 Python validates and normalizes all telemetry into `SecurityEvent` objects,
 routes them to subscribers, and prints the unified model as JSON. Optional SQLite
-persistence and a read-only FastAPI REST API provide the M7 foundation.
+persistence and a read-only FastAPI REST API provide the M7 foundation. M8 adds
+an opt-in Python rule engine with YAML configuration and structured alerts.
 
 Host telemetry is opt-in. The network-only invocation below remains unchanged;
 add `--host` to collect process, syscall, and privilege records alongside packets.
@@ -20,7 +21,8 @@ The C wire formats remain unchanged; normalization happens entirely in Python.
 Prerequisites: Linux with BTF, BPF ring buffers and XDP BPF-link support,
 Clang/LLVM with the BPF target, libbpf development headers, bpftool, pkg-config,
 Make, a C compiler, and Python 3. The collection/normalization/storage path uses
-the standard library; the API additionally requires FastAPI and Uvicorn. The existing
+the standard library; detection requires PyYAML, and the API additionally
+requires FastAPI and Uvicorn. The existing
 `ebpf/include/vmlinux.h` supplies kernel
 types for the CO-RE build; the target kernel must expose BTF.
 
@@ -199,7 +201,9 @@ raises `ValueError`; the CLI reports the error to stderr and exits nonzero.
 synchronous subscribers for all events or a single category. `route(event)`
 validates the model and delivers it to matching consumers without exposing the
 wire format. Subscriber failures propagate to the caller; there is no queue,
-retry, persistence, or replay. For example:
+retry, persistence, or replay in the router itself. The M8 rule subscriber
+contains its own failures; existing storage subscribers retain fail-fast behavior.
+For example:
 
 ```python
 from backend.pipeline import EventRouter, receive_events
@@ -213,8 +217,8 @@ for event in receive_events(connection):
 The CLI's stdout changed from raw envelopes to one complete unified event per
 line. Agent JSON and Unix socket framing remain at schema version 1. The
 privileged regression checkers validate the new stdout schema before checking
-packet endpoints and controlled host activity. M6 remains the normalization boundary. M7 adds optional storage/API below;
-no detection, alerting, correlation, response, or frontend is implemented.
+packet endpoints and controlled host activity. M6 remains the normalization
+boundary. M7 adds storage/API and M8 adds opt-in detection as described below.
 
 ## SQLite persistence and REST API (M7)
 
@@ -289,10 +293,122 @@ Tests use temporary SQLite files and include a real C IPC driver → receiver �
 SQLite → REST round trip for network, process, syscall, and privilege telemetry.
 No real project database is used by the tests.
 
-Run non-privileged parser, validation and real C-to-Python socket tests:
+## Configurable rule engine (M8)
+
+Install the updated requirements, then opt into detection with `--rules`:
+
+```bash
+.venv/bin/python -m pip install -r requirements-dev.txt
+sudo .venv/bin/python backend/receiver.py /run/kernellens/events.sock --rules config/rules.yaml --database /var/lib/kernellens/events.db
+```
+
+The `--database` flag remains optional. Normalized events still go to stdout.
+Each alert is a single JSON object prefixed with `Alert: ` on stderr, alongside
+agent status/error messages. Without `--rules`, M2–M7 behavior is unchanged and
+the receiver does not import PyYAML. The engine runs in Python, with no C/eBPF,
+SQLite schema, or API changes.
+
+`backend/alerts.py` defines `Alert` with a UUID4 `alert_id`, sensor-time
+`timestamp`, `rule_id`, `rule_name`, `alert_type`, configured `severity`,
+`description`, `source_event_ids`, `event_category`, and JSON-compatible
+`metadata`. Alerts are returned by `RuleEngine.evaluate(event)`. Register
+callbacks with `engine.subscribe(consumer)`, then register the engine itself as
+an event subscriber to evaluate and publish alerts:
+
+```python
+from backend.pipeline import EventRouter
+from backend.rule_config import load_rules
+from backend.rules import RuleEngine
+
+engine = RuleEngine(load_rules("config/rules.yaml"))
+engine.subscribe(lambda alert: print(alert.to_dict()))
+router = EventRouter()
+router.subscribe(engine)
+# Independently, after EventStore initialization: router.subscribe(store.insert)
+# Feed normalized SecurityEvent objects using router.route(event).
+```
+
+The serial engine validates and copies each SecurityEvent, and gives each rule
+an independent snapshot. Per-rule errors are logged and other rules continue.
+Engine boundary and alert callback errors are also contained by the subscriber,
+so detection failures do not stop event storage or stdout. Invalid configuration
+fails receiver startup before connecting; it never silently loads a partial
+policy. Alerts/state are not stored in SQLite or exposed through new API routes.
+No alert history is retained internally; callers can consume returned alerts.
+
+Rules use `schema_version: 1` and a `rules` list in YAML. Every entry requires
+`id`, `name`, `enabled` (boolean), `category`, `type`, `severity`, and `description`.
+IDs must be unique, including disabled entries. Static severity is one of
+`info`, `low`, `medium`, `high`, or `critical`; there is no risk score.
+`backend/rule_config.py` uses a restricted [PyYAML SafeLoader](https://pyyaml.org/wiki/PyYAMLDocumentation)
+with duplicate-key rejection. Unknown fields, malformed selectors, unsupported
+category/type pairs, duplicate IDs, and invalid numeric values are errors.
+The file limit is 256 KiB and the rule limit is 128. Even disabled entries must
+be valid. An empty rule list is allowed. Configuration is loaded once at startup.
+
+| Category / type | Condition |
+| --- | --- |
+| network / port_scan | Distinct destination ports among TCP SYN attempts, grouped by source and destination IP |
+| network / syn_flood | Count of TCP SYN attempts per source/destination IP pair |
+| network / traffic_flood | Count of IPv4 packets per source/destination IP pair, across ports/protocols |
+| process / process_match | Exact process name and/or path selectors |
+| syscall / syscall_match | Configured setuid/setgid and optional return value, process name, UID/GID selectors |
+| privilege / privilege_change | Configured current/previous UID/GID or credential-change conditions |
+
+A TCP attempt requires SYN set and ACK clear, with a nonzero destination port.
+SYN/ACKs and unavailable port defaults do not count as connection attempts.
+`OTHER` Ethernet events and zero source/destination IPs are excluded from network
+rules. Traffic flood includes TCP, UDP, ICMP, and other reported IPv4 protocols.
+
+Network rules require `threshold` (integer 1–4096) and `window_seconds` (a finite
+positive number representing 1 ns through 86400 seconds). `max_groups` defaults
+to 128 and must be 1–4096. No host `match` selectors apply to network rules.
+Windows use the original monotonic nanosecond timestamps, not wall time, with a
+nondecreasing high watermark across all consumed events. Samples at or before
+`watermark - window` expire; late samples inside the window are accepted. Every
+event, including host events, prunes expired network groups. During complete
+input inactivity, state remains bounded until the next event advances the clock.
+
+Each group retains fewer than `threshold` samples between evaluations: one most
+recent attempt per destination port for scans, or one per event ID for floods.
+At threshold the engine emits one alert and clears the batch, allowing subsequent
+nonoverlapping batches to alert. Repeated ports alone cannot trigger a scan.
+Network evidence contains original event IDs, observed count, threshold, window,
+source/destination IPs, and first/last sample timestamps (plus destination ports
+for scans). The alert timestamp is the watermark at threshold. A rule retains
+at most `max_groups * threshold` samples during evaluation; reaching the group
+limit evicts the least recently accessed group. Capacity eviction can miss a
+threshold under high source cardinality. No persistent deduplication or replay
+cache exists across completed batches. A new engine starts with empty state.
+
+Host rules require nonempty `match` conditions. Each field is a nonempty list
+of exact accepted values; values within a list use OR, different fields use AND.
+To match a name OR a path independently, configure separate rules. There are no
+regexes, globs, or expression evaluation. Available fields are:
+
+- `process_match`: `process_name`, `process_path`.
+- `syscall_match`: required `syscall` (`setuid`/`setgid`), optional
+  `syscall_return`, `process_name`, `uid`, `gid`.
+- `privilege_change`: `syscall`, `process_name`, `uid`, `gid`, `previous_uid`,
+  `previous_gid`, plus boolean `uid_changed` and `gid_changed`. At least one
+  credential selector/change condition is required. Change booleans compare
+  current credentials with M5 metadata.
+
+Host alerts use the matching event timestamp and preserve the original event ID
+and credential/syscall evidence. The shipped policy enables a basic scan rule,
+a SYN flood rule, EPERM (`syscall_return: [-1]`) credential-syscall monitoring,
+and a real UID transition to root. It does not flag every syscall or credential
+change. Process and traffic-flood examples are disabled for local configuration;
+thresholds and policy choices should be tuned to the intended environment.
+There is no dynamic severity/scoring, correlation, incident handling, WebSocket,
+frontend, enrichment, or response action in M8.
+
+Run all non-privileged parser, validation, storage/API, rule, and C IPC tests:
 
 ```bash
 make test PYTHON=.venv/bin/python
+# Rule-engine tests only (after building the C IPC fixture):
+.venv/bin/python -m unittest discover -s tests -p test_rules.py -v
 ```
 
 Run the privileged integration tests after building:

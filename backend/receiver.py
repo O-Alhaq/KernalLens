@@ -51,8 +51,22 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("socket_path", help="Unix socket exposed by the C agent")
     parser.add_argument("--database", help="persist normalized events to this SQLite file")
+    parser.add_argument("--rules", help="evaluate rules from this YAML file; alerts go to stderr")
     arguments = parser.parse_args()
     try:
+        engine = None
+        if arguments.rules:
+            # Optional detection dependency; the M2–M7 receiver works without YAML.
+            if __package__:
+                from .rule_config import load_rules
+                from .rules import RuleEngine
+            else:
+                from rule_config import load_rules
+                from rules import RuleEngine
+            engine = RuleEngine(load_rules(arguments.rules))
+            engine.subscribe(lambda alert: print(
+                "Alert: " + json.dumps(alert.to_dict(), separators=(",", ":")),
+                file=sys.stderr, flush=True))
         store = None
         if arguments.database:
             store = EventStore(arguments.database)
@@ -60,6 +74,8 @@ def main():
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
             connection.connect(arguments.socket_path)
             router = EventRouter()
+            if engine is not None:
+                router.subscribe(engine)
             if store is not None:
                 router.subscribe(store.insert)
             router.subscribe(lambda event: print(
