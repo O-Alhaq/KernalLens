@@ -7,6 +7,9 @@ rules:
     type: port_scan
     threshold: 10
     window_seconds: 5
+    quiet_seconds: 3
+    max_detection_seconds: 60
+    max_event_ids: 64
     max_groups: 128
     severity: medium
     description: TCP SYN attempts from one source to ten distinct ports on one destination.
@@ -18,6 +21,9 @@ rules:
     type: syn_flood
     threshold: 1000
     window_seconds: 5
+    quiet_seconds: 3
+    max_detection_seconds: 60
+    max_event_ids: 64
     max_groups: 128
     severity: high
     description: One source sent at least 1000 TCP SYN attempts to one destination in five seconds.
@@ -29,6 +35,9 @@ rules:
     type: traffic_flood
     threshold: 2000
     window_seconds: 5
+    quiet_seconds: 3
+    max_detection_seconds: 60
+    max_event_ids: 64
     max_groups: 128
     severity: medium
     description: Example volume rule; enable and tune for the observed network.

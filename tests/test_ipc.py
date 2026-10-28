@@ -88,6 +88,24 @@ class ValidationTests(unittest.TestCase):
                          [STATUS, EVENT])
         self.assertEqual(list(receive_messages(Chunks(wire))), [STATUS, EVENT])
 
+    def test_idle_callbacks_preserve_fragmented_records_and_default_timeout_behavior(self):
+        wire = (json.dumps(STATUS) + "\n" + json.dumps(EVENT) + "\n").encode()
+        class TimedChunks:
+            def __init__(self):
+                self.chunks = iter((None, wire[:20], None, wire[20:], b""))
+
+            def recv(self, size):
+                chunk = next(self.chunks, b"")
+                if chunk is None:
+                    raise TimeoutError()
+                return chunk
+        calls = []
+        self.assertEqual(list(receive_messages(TimedChunks(), on_idle=lambda: calls.append(True))),
+                         [STATUS, EVENT])
+        self.assertEqual(len(calls), 2)
+        with self.assertRaises(TimeoutError):
+            list(receive_messages(TimedChunks()))
+
     def test_malformed_truncated_duplicate_and_oversized(self):
         for wire in (b"not-json\n", b"\xff\n", b"{}", b"x" * 4097,
                      b"x" * 4097 + b"\n", b'{"schema_version":1,"schema_version":1}\n'):

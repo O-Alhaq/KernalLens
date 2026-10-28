@@ -81,6 +81,12 @@ class ConfigurationTests(unittest.TestCase):
     def test_fractional_nanosecond_windows_convert_without_float_timestamp_math(self):
         rules = parse_rules({"schema_version": 1, "rules": [rule(window_seconds=0.001)]})
         self.assertEqual(rules[0].window_ns, 1_000_000)
+        self.assertEqual(rules[0].quiet_ns, 3 * NS)
+        self.assertEqual(rules[0].max_detection_ns, 60 * NS)
+        self.assertEqual(rules[0].max_event_ids, 64)
+        custom = parse_rules({"schema_version": 1, "rules": [
+            rule(window_seconds=0.001, quiet_seconds=0.01, max_detection_seconds=0.5)]})[0]
+        self.assertEqual((custom.quiet_ns, custom.max_detection_ns), (10_000_000, 500_000_000))
 
     def test_invalid_rules_are_rejected_including_disabled_entries(self):
         bad_values = [rule(id="bad id"), rule(enabled="false"), rule(enabled=1),
@@ -90,6 +96,15 @@ class ConfigurationTests(unittest.TestCase):
                       rule(window_seconds=float("nan")), rule(window_seconds=float("inf")),
                       rule(window_seconds=1e-10), rule(window_seconds=86401),
                       rule(max_groups=0), rule(max_groups=4097), rule(extra=True),
+                      rule(quiet_seconds=0), rule(quiet_seconds=True),
+                      rule(quiet_seconds=float("nan")), rule(quiet_seconds=86401),
+                      rule(max_detection_seconds=0), rule(max_detection_seconds=True),
+                      rule(max_detection_seconds=float("inf")), rule(max_detection_seconds=86401),
+                      rule(max_detection_seconds=4),
+                      rule(window_seconds=1, quiet_seconds=3, max_detection_seconds=2),
+                      rule(quiet_seconds=1e-10), rule(max_detection_seconds=1e-10),
+                      rule(quiet_seconds="3"), rule(max_detection_seconds="60"),
+                      rule(max_event_ids=1), rule(max_event_ids=257), rule(max_event_ids=True),
                       rule(name=""), rule(description=None),
                       rule("process_match", match={}),
                       rule("process_match", match={"process_name": "bash"}),
@@ -205,35 +220,102 @@ class HostRuleTests(unittest.TestCase):
 
 
 class NetworkRuleTests(unittest.TestCase):
-    def test_port_scan_distinct_ports_and_nonoverlapping_alert_batches(self):
-        detector = engine(rule())
-        events = [network(timestamp=(index + 1) * NS, dst_port=80 + index) for index in range(3)]
-        self.assertEqual(detector.evaluate(events[0]), [])
-        self.assertEqual(detector.evaluate(network(timestamp=NS, dst_port=80)), [])
-        self.assertEqual(detector.evaluate(events[1]), [])
-        before = events[2].to_dict()
-        alerts = detector.evaluate(events[2])
+    def test_fifty_port_scan_emits_one_complete_alert_after_quiet(self):
+        detector = engine(rule(threshold=10, max_event_ids=8))
+        events = [network(timestamp=NS + index * 50_000_000, dst_port=1000 + index)
+                  for index in range(50)]
+        for index, event in enumerate(events, 1):
+            before = event.to_dict()
+            self.assertEqual(detector.evaluate(event), [])
+            self.assertEqual(event.to_dict(), before)
+            if index in (10, 20, 30, 50):
+                self.assertEqual(len(detector._runtimes[0].groups), 1)
+                self.assertTrue(next(iter(detector._runtimes[0].groups.values())).active)
+        last = events[-1].timestamp
+        self.assertEqual(detector.advance_time(last + 3 * NS - 1), [])
+        alerts = detector.advance_time(last + 3 * NS)
         self.assertEqual(len(alerts), 1)
-        self.assertEqual(alerts[0].metadata["destination_ports"], [80, 81, 82])
-        # Repeated port replaces evidence with its newest observed attempt.
-        self.assertEqual(len(alerts[0].source_event_ids), 3)
-        self.assertEqual(alerts[0].source_event_ids[-2:], (events[1].event_id, events[2].event_id))
-        self.assertEqual(events[2].to_dict(), before)
+        alert = alerts[0]
+        self.assertEqual(alert.metadata["unique_port_count"], 50)
+        self.assertEqual(alert.metadata["matching_event_count"], 50)
+        self.assertEqual(alert.metadata["destination_ports"], list(range(1000, 1050)))
+        self.assertEqual(alert.metadata["first_timestamp"], events[0].timestamp)
+        self.assertEqual(alert.metadata["threshold_timestamp"], events[9].timestamp)
+        self.assertEqual(alert.metadata["last_timestamp"], last)
+        self.assertEqual(alert.metadata["duration_ns"], last - events[0].timestamp)
+        self.assertEqual(alert.metadata["finalization_reason"], "quiet")
+        self.assertLessEqual(len(alert.source_event_ids), 8)
+        self.assertIn(events[0].event_id, alert.source_event_ids)
+        self.assertIn(events[-1].event_id, alert.source_event_ids)
+        self.assertTrue(alert.metadata["source_event_ids_truncated"])
+        self.assertEqual(detector.advance_time(last + 10 * NS), [])
+        self.assertEqual(detector.flush(), [])
         self.assertEqual(detector._runtimes[0].groups, {})
-        self.assertEqual(detector.evaluate(network(timestamp=4 * NS, dst_port=83)), [])
 
-    def test_syn_flood_counts_attempts_not_distinct_ports_and_ignores_syn_ack(self):
+    def test_new_ten_port_scan_after_fifty_port_session_gets_its_own_alert(self):
+        detector = engine(rule(threshold=10))
+        for port in range(1000, 1050):
+            self.assertEqual(detector.evaluate(network(timestamp=NS, dst_port=port)), [])
+        first = detector.advance_time(4 * NS)
+        self.assertEqual(len(first), 1)
+        self.assertEqual(first[0].metadata["unique_port_count"], 50)
+        for port in range(2000, 2010):
+            self.assertEqual(detector.evaluate(network(timestamp=5 * NS, dst_port=port)), [])
+        second = detector.advance_time(8 * NS)
+        self.assertEqual(len(second), 1)
+        self.assertNotEqual(first[0].alert_id, second[0].alert_id)
+        self.assertEqual(second[0].metadata["unique_port_count"], 10)
+        self.assertEqual(second[0].metadata["destination_ports"], list(range(2000, 2010)))
+        self.assertEqual(detector.flush(), [])
+
+    def test_repeated_ports_do_not_confirm_scan_but_all_attempts_extend_active_session(self):
+        detector = engine(rule())
+        for _ in range(20):
+            self.assertEqual(detector.evaluate(network(dst_port=80)), [])
+        session = next(iter(detector._runtimes[0].groups.values()))
+        self.assertFalse(session.active)
+        self.assertEqual(len(session.pending), 1)
+        detector.evaluate(network(timestamp=2 * NS, dst_port=81))
+        detector.evaluate(network(timestamp=3 * NS, dst_port=82))
+        self.assertTrue(session.active)
+        detector.evaluate(network(timestamp=5 * NS, dst_port=80))
+        self.assertEqual(detector.advance_time(6 * NS), [])  # repeated port extended quiet deadline
+        alert = detector.advance_time(8 * NS)[0]
+        self.assertEqual(alert.metadata["unique_port_count"], 3)
+        self.assertEqual(alert.metadata["matching_event_count"], 23)
+        self.assertEqual(alert.metadata["first_timestamp"], NS)
+        self.assertEqual(alert.metadata["threshold_timestamp"], 3 * NS)
+
+    def test_floods_accumulate_full_activity_not_threshold_batches(self):
+        for kind in ("syn_flood", "traffic_flood"):
+            with self.subTest(kind=kind):
+                detector = engine(rule(kind, threshold=5, max_event_ids=8))
+                events = [network(timestamp=NS + index * 1_000_000) for index in range(100)]
+                for event in events:
+                    self.assertEqual(detector.evaluate(event), [])
+                alert = detector.advance_time(events[-1].timestamp + 3 * NS)[0]
+                self.assertEqual(alert.metadata["matching_event_count"], 100)
+                self.assertNotIn("count", alert.metadata)
+                self.assertNotIn("unique_port_count", alert.metadata)
+                self.assertEqual(alert.metadata["threshold_timestamp"], events[4].timestamp)
+                self.assertEqual(alert.metadata["last_timestamp"], events[-1].timestamp)
+                self.assertLessEqual(len(alert.source_event_ids), 8)
+                self.assertEqual(detector.flush(), [])
+
+    def test_syn_attempt_filter_and_duplicate_event_replays(self):
         detector = engine(rule("syn_flood"))
         for flags in (0, 16, 18):
             self.assertEqual(detector.evaluate(network(tcp_flags=flags)), [])
         self.assertEqual(detector.evaluate(network(protocol="UDP", tcp_flags=0)), [])
         events = [network() for _ in range(3)]
-        self.assertEqual(detector.evaluate(events[0]), [])
-        self.assertEqual(detector.evaluate(events[0]), [])  # same event ID is not another packet
-        self.assertEqual(detector.evaluate(events[1]), [])
-        alert = detector.evaluate(events[2])[0]
-        self.assertEqual(alert.source_event_ids, tuple(event.event_id for event in events))
-        self.assertEqual(alert.metadata["count"], 3)
+        for event in events:
+            self.assertEqual(detector.evaluate(event), [])
+            self.assertEqual(detector.evaluate(event), [])
+        self.assertEqual(detector.evaluate(events[0]), [])  # replay while ACTIVE
+        alert = detector.advance_time(4 * NS)[0]
+        self.assertEqual(set(alert.source_event_ids), {event.event_id for event in events})
+        self.assertEqual(alert.metadata["matching_event_count"], 3)
+        self.assertFalse(alert.metadata["source_event_ids_truncated"])
 
     def test_traffic_flood_includes_tcp_udp_icmp_and_excludes_other(self):
         detector = engine(rule("traffic_flood"))
@@ -242,61 +324,258 @@ class NetworkRuleTests(unittest.TestCase):
         self.assertEqual(detector.evaluate(other), [])
         self.assertEqual(detector.evaluate(network()), [])
         self.assertEqual(detector.evaluate(network(protocol="UDP", tcp_flags=0)), [])
-        self.assertEqual(len(detector.evaluate(network(protocol="ICMP", tcp_flags=0,
-                                                        src_port=0, dst_port=0))), 1)
+        self.assertEqual(detector.evaluate(network(protocol="ICMP", tcp_flags=0,
+                                                    src_port=0, dst_port=0)), [])
+        self.assertEqual(detector.advance_time(4 * NS)[0].metadata["matching_event_count"], 3)
 
-    def test_sources_and_destinations_are_separate_groups(self):
-        detector = engine(rule(threshold=2))
+    def test_sources_destinations_and_rules_have_independent_sessions(self):
+        detector = engine(rule(threshold=1, quiet_seconds=2),
+                          rule(threshold=1, id="second", quiet_seconds=3))
         for values in ({}, {"src_ip": "192.0.2.3"}, {"dst_ip": "192.0.2.4"}):
             self.assertEqual(detector.evaluate(network(**values)), [])
-        alert = detector.evaluate(network(dst_port=81))[0]
-        self.assertEqual((alert.metadata["src_ip"], alert.metadata["dst_ip"]),
-                         ("192.0.2.1", "192.0.2.2"))
-        self.assertEqual(len(detector._runtimes[0].groups), 2)
+        first = detector.advance_time(3 * NS)
+        self.assertEqual(len(first), 3)
+        self.assertTrue(all(alert.rule_id == "port_scan" for alert in first))
+        second = detector.advance_time(4 * NS)
+        self.assertEqual(len(second), 3)
+        self.assertTrue(all(alert.rule_id == "second" for alert in second))
+        pairs = {(alert.metadata["src_ip"], alert.metadata["dst_ip"]) for alert in first}
+        self.assertEqual(len(pairs), 3)
 
-    def test_time_windows_expire_at_cutoff_and_unrelated_events_prune_all_keys(self):
+    def test_other_source_and_destination_finalize_while_first_session_is_still_active(self):
+        detector = engine(rule(threshold=2))
+        first = {"src_ip": "192.168.150.134", "dst_ip": "192.168.150.138"}
+        other_source = {**first, "src_ip": "192.168.150.200"}
+        other_destination = {**first, "dst_ip": "192.168.150.139"}
+        for values, timestamp in ((first, NS), (other_source, 2 * NS),
+                                  (other_destination, 2 * NS + NS // 2)):
+            for port in (80, 81):
+                detector.evaluate(network(timestamp=timestamp, dst_port=port, **values))
+        # Keep the first session alive while the other two become quiet.
+        detector.evaluate(network(timestamp=3 * NS + NS // 2, dst_port=82, **first))
+        alerts = detector.advance_time(5 * NS)
+        self.assertEqual(len(alerts), 1)
+        self.assertEqual(alerts[0].metadata["src_ip"], other_source["src_ip"])
+        self.assertEqual(alerts[0].metadata["dst_ip"], first["dst_ip"])
+        self.assertIn((first["src_ip"], first["dst_ip"]), detector._runtimes[0].groups)
+        alerts = detector.advance_time(5 * NS + NS // 2)
+        self.assertEqual(len(alerts), 1)
+        self.assertEqual(alerts[0].metadata["dst_ip"], other_destination["dst_ip"])
+        last = detector.advance_time(6 * NS + NS // 2)
+        self.assertEqual(len(last), 1)
+        self.assertEqual(last[0].metadata["src_ip"], first["src_ip"])
+        self.assertEqual(last[0].metadata["unique_port_count"], 3)
+
+    def test_below_threshold_expires_without_alert_and_window_cutoff_is_exclusive(self):
         for kind in ("port_scan", "syn_flood", "traffic_flood"):
             with self.subTest(kind=kind):
                 detector = engine(rule(kind, threshold=2, window_seconds=1))
-                first = network(timestamp=NS, dst_port=80)
-                self.assertEqual(detector.evaluate(first), [])
-                second = network(timestamp=2 * NS, dst_port=81)
-                self.assertEqual(detector.evaluate(second), [])  # first expired exactly at cutoff
-                third = network(timestamp=2 * NS + 1, dst_port=82)
-                self.assertEqual(len(detector.evaluate(third)), 1)
-                detector.evaluate(network(timestamp=3 * NS))
-                detector.evaluate(network(timestamp=3 * NS, src_ip="192.0.2.3"))
-                detector.evaluate(host(timestamp=5 * NS))
+                detector.evaluate(network(timestamp=NS, dst_port=80))
+                self.assertEqual(detector.evaluate(network(timestamp=2 * NS, dst_port=81)), [])
+                session = next(iter(detector._runtimes[0].groups.values()))
+                self.assertFalse(session.active)
+                self.assertEqual(session.matching_event_count, 1)
+                self.assertEqual(detector.advance_time(3 * NS), [])
                 self.assertEqual(detector._runtimes[0].groups, {})
+                self.assertEqual(detector.flush(), [])
 
-    def test_out_of_order_events_use_non_decreasing_watermark(self):
+    def test_confirmation_window_is_separate_from_full_candidate_activity_totals(self):
+        for kind in ("port_scan", "syn_flood", "traffic_flood"):
+            detector = engine(rule(kind, threshold=3, window_seconds=2))
+            for second in (1, 2, 3):
+                self.assertEqual(detector.evaluate(network(timestamp=second * NS, dst_port=80 + second)), [])
+            session = next(iter(detector._runtimes[0].groups.values()))
+            self.assertFalse(session.active)  # Three overall, only two inside confirmation window.
+            detector.evaluate(network(timestamp=3 * NS + 1, dst_port=84))
+            self.assertTrue(session.active)
+            alert = detector.advance_time(6 * NS + 1)[0]
+            self.assertEqual(alert.metadata["matching_event_count"], 4)
+            self.assertEqual(alert.metadata["first_timestamp"], NS)
+            if kind == "port_scan":
+                self.assertEqual(alert.metadata["unique_port_count"], 4)
+
+    def test_confirmed_state_outlives_confirmation_window_and_host_events_finalize(self):
+        detector = engine(rule(threshold=2, window_seconds=1, quiet_seconds=3))
+        detector.evaluate(network(timestamp=NS, dst_port=80))
+        detector.evaluate(network(timestamp=NS + 1, dst_port=81))
+        detector.evaluate(network(timestamp=3 * NS, dst_port=82))
+        self.assertEqual(detector.advance_time(5 * NS), [])
+        alerts = detector.evaluate(host(timestamp=6 * NS))
+        self.assertEqual(len(alerts), 1)
+        self.assertEqual(alerts[0].metadata["unique_port_count"], 3)
+        self.assertEqual(alerts[0].metadata["first_timestamp"], NS)
+
+    def test_out_of_order_events_and_backwards_ticks_do_not_regress_time(self):
         detector = engine(rule(threshold=3, window_seconds=2))
-        self.assertEqual(detector.evaluate(network(timestamp=10 * NS, dst_port=80)), [])
-        self.assertEqual(detector.evaluate(network(timestamp=8 * NS, dst_port=81)), [])
-        self.assertEqual(detector.evaluate(network(timestamp=9 * NS, dst_port=81)), [])
-        alert = detector.evaluate(network(timestamp=9 * NS + 1, dst_port=82))[0]
-        self.assertEqual(alert.timestamp, 10 * NS)
-        self.assertEqual(alert.metadata["first_timestamp"], 9 * NS)
+        detector.evaluate(network(timestamp=10 * NS, dst_port=80))
+        detector.evaluate(network(timestamp=8 * NS, dst_port=81))  # outside window
+        detector.evaluate(network(timestamp=9 * NS, dst_port=81))
+        self.assertEqual(detector.evaluate(network(timestamp=9 * NS + 1, dst_port=82)), [])
+        self.assertEqual(detector.advance_time(7 * NS), [])
         self.assertEqual(detector._watermark, 10 * NS)
+        detector.evaluate(network(timestamp=8 * NS, dst_port=83))  # still too old
+        alert = detector.advance_time(13 * NS)[0]
+        self.assertEqual(alert.metadata["unique_port_count"], 3)
+        self.assertEqual(alert.metadata["threshold_timestamp"], 10 * NS)
+        self.assertEqual(alert.metadata["first_timestamp"], 9 * NS)
+        self.assertEqual(alert.metadata["last_timestamp"], 10 * NS)
+        # Delayed packets from the finalized session cannot reopen it.
+        self.assertEqual(detector.evaluate(network(timestamp=10 * NS, dst_port=84)), [])
+        self.assertEqual(detector._runtimes[0].groups, {})
 
-    def test_group_count_and_sample_count_are_bounded_with_lru_eviction(self):
-        detector = engine(rule(threshold=3, max_groups=2))
+    def test_late_confirmation_never_finalizes_before_threshold_timestamp(self):
+        detector = engine(rule(threshold=3, window_seconds=5, quiet_seconds=1))
+        detector.evaluate(network(timestamp=16 * NS, dst_port=80))
+        detector.evaluate(network(timestamp=17 * NS, dst_port=81))
+        detector.advance_time(20 * NS)
+        alert = detector.evaluate(network(timestamp=18 * NS, dst_port=82))[0]
+        self.assertEqual(alert.metadata["unique_port_count"], 3)
+        self.assertEqual(alert.metadata["threshold_timestamp"], 20 * NS)
+        self.assertEqual(alert.timestamp, 20 * NS)
+        self.assertEqual(detector.flush(), [])
+
+    def test_maximum_active_lifetime_splits_continuous_activity_at_time_not_count(self):
+        for kind in ("port_scan", "syn_flood", "traffic_flood"):
+            with self.subTest(kind=kind):
+                detector = engine(rule(kind, threshold=1, quiet_seconds=3, max_detection_seconds=5))
+                alerts = []
+                for second in range(1, 11):
+                    alerts.extend(detector.evaluate(network(timestamp=second * NS, dst_port=80 + second)))
+                self.assertEqual(len(alerts), 1)
+                first = alerts[0]
+                self.assertEqual(first.timestamp, 6 * NS)
+                self.assertEqual(first.metadata["finalization_reason"], "max_duration")
+                self.assertEqual(first.metadata["matching_event_count"], 5)
+                self.assertEqual(first.metadata["last_timestamp"], 5 * NS)
+                second = detector.advance_time(11 * NS)[0]
+                self.assertEqual(second.metadata["matching_event_count"], 5)
+                self.assertEqual(second.metadata["first_timestamp"], 6 * NS)
+                self.assertEqual(detector.advance_time(20 * NS), [])
+
+    def test_max_duration_starts_at_confirmation_not_first_candidate(self):
+        detector = engine(rule(threshold=2, window_seconds=1, quiet_seconds=1,
+                               max_detection_seconds=2))
+        detector.evaluate(network(timestamp=NS, dst_port=80))
+        confirmed = NS + NS // 2
+        detector.evaluate(network(timestamp=confirmed, dst_port=81))
+        detector.evaluate(network(timestamp=2 * NS + 400_000_000, dst_port=82))
+        detector.evaluate(network(timestamp=3 * NS + 300_000_000, dst_port=83))
+        self.assertEqual(detector.advance_time(confirmed + 2 * NS - 1), [])
+        alert = detector.advance_time(confirmed + 2 * NS)[0]
+        self.assertEqual(alert.metadata["threshold_timestamp"], confirmed)
+        self.assertEqual(alert.metadata["finalization_reason"], "max_duration")
+        self.assertEqual(alert.metadata["unique_port_count"], 4)
+
+    def test_next_activity_at_quiet_boundary_starts_a_new_session(self):
+        detector = engine(rule(threshold=1, quiet_seconds=2))
+        detector.evaluate(network(timestamp=NS, dst_port=80))
+        alerts = detector.evaluate(network(timestamp=3 * NS, dst_port=81))
+        self.assertEqual(len(alerts), 1)
+        self.assertEqual(alerts[0].metadata["destination_ports"], [80])
+        self.assertEqual(detector.advance_time(5 * NS)[0].metadata["destination_ports"], [81])
+        self.assertEqual(detector.advance_time(20 * NS), [])
+
+    def test_unrelated_or_nonmatching_traffic_does_not_extend_quiet_time(self):
+        detector = engine(rule("syn_flood", threshold=1))
+        detector.evaluate(network(timestamp=NS))
+        detector.evaluate(network(timestamp=2 * NS, tcp_flags=18))
+        self.assertEqual(detector.advance_time(4 * NS)[0].metadata["matching_event_count"], 1)
+
+    def test_group_limit_evicts_pending_candidates_but_never_discards_active_sessions(self):
+        detector = engine(rule(threshold=2, max_groups=2))
         detector.evaluate(network(src_ip="192.0.2.1", dst_port=80))
-        detector.evaluate(network(src_ip="192.0.2.2", dst_port=80))
-        detector.evaluate(network(src_ip="192.0.2.1", dst_port=81))
-        detector.evaluate(network(src_ip="192.0.2.3", dst_port=80))
+        detector.evaluate(network(src_ip="192.0.2.1", dst_port=81))  # active
+        detector.evaluate(network(src_ip="192.0.2.2", dst_port=80))  # pending
+        detector.evaluate(network(src_ip="192.0.2.3", dst_port=80))  # replaces pending
         groups = detector._runtimes[0].groups
         self.assertEqual(len(groups), 2)
         self.assertNotIn(("192.0.2.2", "192.0.2.2"), groups)
-        for port in range(100, 110):
-            detector.evaluate(network(src_ip="192.0.2.1", dst_port=port))
-            self.assertTrue(all(len(samples) < 3 for samples in groups.values()))
-        self.assertEqual(detector.evaluate(network(src_ip="192.0.2.2", dst_port=81)), [])
+        detector.evaluate(network(src_ip="192.0.2.3", dst_port=81))  # second active
+        self.assertEqual(detector.evaluate(network(src_ip="192.0.2.4", dst_port=80)), [])
+        self.assertNotIn(("192.0.2.4", "192.0.2.2"), groups)
+        detector.evaluate(network(src_ip="192.0.2.1", dst_port=82))
+        alerts = detector.advance_time(4 * NS)
+        self.assertEqual(sorted(alert.metadata["unique_port_count"] for alert in alerts), [2, 3])
+        self.assertEqual(groups, {})
+
+    def test_large_session_counts_and_ports_stay_complete_with_capped_uuid_memory(self):
+        for kind in ("port_scan", "syn_flood", "traffic_flood"):
+            with self.subTest(kind=kind):
+                detector = engine(rule(kind, threshold=3, max_event_ids=4))
+                events = [network(dst_port=index + 1) for index in range(700)]
+                events.append(network(dst_port=65535))
+                for event in events:
+                    self.assertEqual(detector.evaluate(event), [])
+                session = next(iter(detector._runtimes[0].groups.values()))
+                self.assertEqual(session.pending, {})
+                self.assertLessEqual(len(session.evidence), 2)
+                self.assertLessEqual(len(session.recent_ids), 4)
+                if kind == "port_scan":
+                    self.assertEqual(len(session.ports), 8192)
+                alert = detector.advance_time(4 * NS)[0]
+                self.assertEqual(alert.metadata["matching_event_count"], 701)
+                self.assertLessEqual(len(alert.source_event_ids), 4)
+                self.assertTrue(alert.metadata["source_event_ids_truncated"])
+                if kind == "port_scan":
+                    self.assertEqual(alert.metadata["unique_port_count"], 701)
+                    self.assertEqual(alert.metadata["destination_ports"], list(range(1, 701)) + [65535])
+
+    def test_large_flood_retains_true_total_after_uuid_sample_fills(self):
+        detector = engine(rule("syn_flood", threshold=10, max_event_ids=8))
+        for index in range(10_000):
+            self.assertEqual(detector.evaluate(network(timestamp=NS + index)), [])
+            if index in (9, 99, 999, 9999):
+                session = next(iter(detector._runtimes[0].groups.values()))
+                self.assertTrue(session.active)
+                self.assertEqual(session.pending, {})
+                self.assertLessEqual(len(session.evidence) + 2, 8)
+                self.assertLessEqual(len(session.recent_ids), 8)
+        alerts = detector.advance_time(4 * NS + 9999)
+        self.assertEqual(len(alerts), 1)
+        self.assertEqual(alerts[0].metadata["matching_event_count"], 10_000)
+        self.assertTrue(1 <= len(alerts[0].source_event_ids) <= 8)
+        self.assertEqual(detector.flush(), [])
+
+    def test_closed_session_cache_is_bounded_and_event_id_sample_can_be_two(self):
+        detector = engine(rule(threshold=1, max_groups=2, max_event_ids=2, quiet_seconds=0.1))
+        for index in range(6):
+            timestamp = NS + index * 200_000_000
+            first = network(timestamp=timestamp, src_ip=f"192.0.2.{index + 1}")
+            last = network(timestamp=timestamp + 1, src_ip=first.src_ip, dst_port=81)
+            detector.evaluate(first)
+            detector.evaluate(last)
+            alert = detector.advance_time(timestamp + 100_000_001)[0]
+            self.assertEqual(alert.source_event_ids, (first.event_id, last.event_id))
+            self.assertLessEqual(len(detector._runtimes[0].closed_before), 2)
 
     def test_unavailable_ports_do_not_become_scan_or_syn_attempts(self):
         detector = engine(rule(threshold=1), rule("syn_flood", threshold=1))
         self.assertEqual(detector.evaluate(network(dst_port=0)), [])
         self.assertEqual(detector.evaluate(network(src_ip="0.0.0.0")), [])
+        self.assertEqual(detector.flush(), [])
+
+    def test_timer_and_flush_publish_once_and_discard_unconfirmed_candidates(self):
+        detector = engine(rule(threshold=2))
+        alerts = []
+        detector.subscribe(alerts.append)
+        detector(network(dst_port=80))
+        self.assertEqual(detector.flush(), [])
+        detector(network(dst_port=81))
+        detector(network(dst_port=82))
+        self.assertEqual(alerts, [])
+        flushed = detector.flush(reason="shutdown")
+        self.assertEqual(alerts, flushed)
+        self.assertEqual(len(alerts), 1)
+        self.assertEqual(alerts[0].metadata["finalization_reason"], "shutdown")
+        self.assertEqual(detector.flush(), [])
+        self.assertEqual(detector.tick(4 * NS), [])
+        detector(network(timestamp=5 * NS, dst_port=80))
+        detector(network(timestamp=5 * NS, dst_port=81))
+        self.assertEqual(detector.tick(8 * NS), alerts[1:])
+        self.assertEqual(len(alerts), 2)
+        for timestamp in (True, -1, 2**64, 1.5):
+            with self.assertRaises(ValueError):
+                detector.advance_time(timestamp)
 
 
 class RuleIsolationTests(unittest.TestCase):
@@ -325,6 +604,21 @@ class RuleIsolationTests(unittest.TestCase):
             self.assertEqual(store.get(event.event_id).to_dict(), before)
         self.assertEqual([alert.rule_id for alert in received], ["working"])
         self.assertEqual(event.to_dict(), before)
+
+    def test_timer_and_flush_failures_do_not_break_other_rules_or_alert_consumers(self):
+        for method in ("advance", "flush"):
+            detector = engine(rule(threshold=1, id="broken"), rule(threshold=1, id="working"))
+            received = []
+            def fail_alert(alert):
+                raise RuntimeError("simulated sink failure")
+            detector.subscribe(fail_alert)
+            detector.subscribe(received.append)
+            detector(network())
+            with patch.object(detector._runtimes[0], method, side_effect=RuntimeError("failed")):
+                with self.assertLogs("backend.rules", level="ERROR"):
+                    alerts = detector.tick(4 * NS) if method == "advance" else detector.flush()
+            self.assertEqual([alert.rule_id for alert in alerts], ["working"])
+            self.assertEqual(received, alerts)
 
     def test_engine_boundary_failure_is_contained(self):
         detector = engine(rule())
@@ -391,9 +685,47 @@ class RuleTransportTests(unittest.TestCase):
                       for line in errors.splitlines() if line.startswith("Alert: ")]
             self.assertEqual(len(events), 4)
             self.assertEqual(len(alerts), 4)
-            self.assertEqual([alert["source_event_ids"] for alert in alerts],
-                             [[event["event_id"]] for event in events])
+            self.assertEqual({tuple(alert["source_event_ids"]) for alert in alerts},
+                             {(event["event_id"],) for event in events})
+            network_alert = next(alert for alert in alerts if alert["event_category"] == "network")
+            self.assertEqual(network_alert["metadata"]["finalization_reason"], "stream_end")
             self.assertEqual([event.to_dict() for event in EventStore(database).list_events()], events)
+        finally:
+            if receiver.poll() is None:
+                receiver.kill()
+            receiver.communicate()
+
+    def test_idle_socket_finalizes_without_another_event_or_disconnect(self):
+        path = Path(self.directory.name) / "rules.yaml"
+        path.write_text(yaml.safe_dump({"schema_version": 1, "rules": [
+            rule("syn_flood", threshold=2, quiet_seconds=0.05, max_event_ids=4)]}))
+        receiver = subprocess.Popen(
+            [sys.executable, "backend/receiver.py", self.path, "--rules", str(path)],
+            cwd=test_ipc.ROOT, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        try:
+            for _ in range(100):
+                self.command("poll")
+                if select.select([receiver.stderr], [], [], 0.05)[0]:
+                    break
+            else:
+                self.fail("rule-enabled receiver did not connect")
+            self.assertEqual(receiver.stderr.readline().strip(), "Agent status: ready")
+            for _ in range(10):
+                self.command("event")
+            self.assertTrue(select.select([receiver.stderr], [], [], 3)[0], "missing idle alert")
+            line = receiver.stderr.readline()
+            self.assertTrue(line.startswith("Alert: "), line)
+            alert = json.loads(line.removeprefix("Alert: "))
+            self.assertEqual(alert["metadata"]["matching_event_count"], 10)
+            self.assertEqual(alert["metadata"]["finalization_reason"], "quiet")
+            self.assertLessEqual(len(alert["source_event_ids"]), 4)
+            self.assertIsNone(receiver.poll())
+            self.assertIsNone(self.driver.poll())  # Both ends still open when the alert arrives.
+            self.stop_driver()
+            output, errors = receiver.communicate(timeout=3)
+            self.assertEqual(receiver.returncode, 0, errors)
+            self.assertEqual(len(output.splitlines()), 10)
+            self.assertNotIn("Alert: ", errors)  # EOF does not emit the same session again.
         finally:
             if receiver.poll() is None:
                 receiver.kill()

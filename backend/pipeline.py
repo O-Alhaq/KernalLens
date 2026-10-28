@@ -6,13 +6,13 @@ else:
     from events import SecurityEvent, normalize_message
 
 
-def receive_events(connection, on_status=None):
+def receive_events(connection, on_status=None, on_idle=None):
     # Lazy import keeps the wire decoder independently usable for M3 regressions.
     if __package__:
         from .receiver import receive_messages
     else:
         from receiver import receive_messages
-    for message in receive_messages(connection):
+    for message in receive_messages(connection, on_idle=on_idle):
         if message["message_type"] == "status":
             if on_status is not None:
                 on_status(message)

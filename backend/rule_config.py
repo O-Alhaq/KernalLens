@@ -50,6 +50,18 @@ def _integer(value, minimum, maximum, name):
     return value
 
 
+def _duration(value, name):
+    if type(value) not in (int, float):
+        raise RuleConfigError(f"{name} must be a number")
+    try:
+        nanos = Decimal(str(value)) * 1_000_000_000
+        if not nanos.is_finite() or not 1 <= nanos <= 86400 * 1_000_000_000 or nanos != nanos.to_integral_value():
+            raise RuleConfigError(f"{name} must represent 1ns through 86400s")
+    except InvalidOperation as error:
+        raise RuleConfigError(f"invalid {name}") from error
+    return int(nanos)
+
+
 def _text(value, name, maximum=1024):
     if not isinstance(value, str) or not value.strip() or len(value) > maximum or "\0" in value:
         raise RuleConfigError(f"invalid {name}")
@@ -69,6 +81,9 @@ class Rule:
     threshold: int = 0
     window_ns: int = 0
     max_groups: int = 0
+    quiet_ns: int = 3_000_000_000
+    max_detection_ns: int = 60_000_000_000
+    max_event_ids: int = 64
 
 
 def _parse_rule(raw):
@@ -91,22 +106,26 @@ def _parse_rule(raw):
     values["name"] = _text(raw["name"], "name", 200)
     values["description"] = _text(raw["description"], "description")
     network = raw["category"] == "network"
-    allowed = common | ({"threshold", "window_seconds", "max_groups"} if network else {"match"})
+    allowed = common | ({"threshold", "window_seconds", "max_groups", "quiet_seconds",
+                         "max_detection_seconds", "max_event_ids"} if network else {"match"})
     if raw.keys() - allowed:
         raise RuleConfigError("unknown rule fields")
     if network:
         threshold = _integer(raw.get("threshold"), 1, MAX_THRESHOLD, "threshold")
-        seconds = raw.get("window_seconds")
-        if type(seconds) not in (int, float):
-            raise RuleConfigError("window_seconds must be a number")
-        try:
-            nanos = Decimal(str(seconds)) * 1_000_000_000
-            if not nanos.is_finite() or not 1 <= nanos <= 86400 * 1_000_000_000 or nanos != nanos.to_integral_value():
-                raise RuleConfigError("window_seconds must represent 1ns through 86400s")
-        except InvalidOperation as error:
-            raise RuleConfigError("invalid window_seconds") from error
-        return Rule(**values, match=MappingProxyType({}), threshold=threshold,
-                    window_ns=int(nanos), max_groups=_integer(raw.get("max_groups", 128), 1, 4096, "max_groups"))
+        window_ns = _duration(raw.get("window_seconds"), "window_seconds")
+        quiet_ns = _duration(raw.get("quiet_seconds", 3), "quiet_seconds")
+        maximum_ns = _duration(raw.get("max_detection_seconds", 60), "max_detection_seconds")
+        # Keep the configured session horizon at least as long as either the
+        # confirmation window or the intended quiet period. Compare integer ns.
+        if maximum_ns < max(window_ns, quiet_ns):
+            raise RuleConfigError(
+                "max_detection_seconds must be >= window_seconds and quiet_seconds")
+        return Rule(
+            **values, match=MappingProxyType({}), threshold=threshold,
+            window_ns=window_ns,
+            max_groups=_integer(raw.get("max_groups", 128), 1, 4096, "max_groups"),
+            quiet_ns=quiet_ns, max_detection_ns=maximum_ns,
+            max_event_ids=_integer(raw.get("max_event_ids", 64), 2, 256, "max_event_ids"))
     match = raw.get("match")
     if not isinstance(match, dict) or not match or match.keys() - MATCH_FIELDS[rule_type]:
         raise RuleConfigError("invalid or empty host match conditions")

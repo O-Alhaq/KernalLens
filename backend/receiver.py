@@ -5,6 +5,7 @@ import json
 import socket
 import sqlite3
 import sys
+import time
 
 if __package__:
     from .storage import EventStore
@@ -27,11 +28,17 @@ def unique_object(pairs):
     return result
 
 
-def receive_messages(connection):
+def receive_messages(connection, on_idle=None):
     """Decode newline-delimited JSON regardless of stream read boundaries."""
     pending = b""
     while True:
-        chunk = connection.recv(MAX_RECORD)
+        try:
+            chunk = connection.recv(MAX_RECORD)
+        except TimeoutError:
+            if on_idle is None:
+                raise
+            on_idle()
+            continue
         if not chunk:
             if pending:
                 raise ValueError("truncated JSON record at disconnect")
@@ -53,8 +60,9 @@ def main():
     parser.add_argument("--database", help="persist normalized events to this SQLite file")
     parser.add_argument("--rules", help="evaluate rules from this YAML file; alerts go to stderr")
     arguments = parser.parse_args()
+    engine = None
+    finish_reason = "shutdown"
     try:
-        engine = None
         if arguments.rules:
             # Optional detection dependency; the M2–M7 receiver works without YAML.
             if __package__:
@@ -63,7 +71,8 @@ def main():
             else:
                 from rule_config import load_rules
                 from rules import RuleEngine
-            engine = RuleEngine(load_rules(arguments.rules))
+            rules = load_rules(arguments.rules)
+            engine = RuleEngine(rules)
             engine.subscribe(lambda alert: print(
                 "Alert: " + json.dumps(alert.to_dict(), separators=(",", ":")),
                 file=sys.stderr, flush=True))
@@ -73,6 +82,10 @@ def main():
             store.initialize()
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
             connection.connect(arguments.socket_path)
+            if engine is not None:
+                intervals = [min(rule.quiet_ns, rule.max_detection_ns) / 1_000_000_000
+                             for rule in rules if rule.enabled and rule.category == "network"]
+                connection.settimeout(max(0.001, min([0.25, *intervals])))
             router = EventRouter()
             if engine is not None:
                 router.subscribe(engine)
@@ -81,13 +94,18 @@ def main():
             router.subscribe(lambda event: print(
                 json.dumps(event.to_dict(), separators=(",", ":")), flush=True))
             for event in receive_events(connection, on_status=lambda message: print(
-                    "Agent status: ready", file=sys.stderr, flush=True)):
+                    "Agent status: ready", file=sys.stderr, flush=True),
+                    on_idle=(lambda: engine.tick(time.monotonic_ns())) if engine is not None else None):
                 router.route(event)
+            finish_reason = "stream_end"
     except KeyboardInterrupt:
         return 0
     except (OSError, ValueError, sqlite3.Error) as error:
         print(f"Receiver error: {error}", file=sys.stderr)
         return 1
+    finally:
+        if engine is not None:
+            engine.flush(reason=finish_reason)
     return 0
 
 

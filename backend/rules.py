@@ -15,10 +15,69 @@ else:
 logger = logging.getLogger(__name__)
 
 
+class _Session:
+    """Bounded evidence plus exact aggregate counts for one IP pair.
+
+    Pending confirmation retains fewer than threshold window samples. Once
+    confirmed, those samples are discarded; only aggregates, an 8192-byte scan
+    port bitmap, and capped UUID samples/recent replay checks remain.
+    """
+
+    def __init__(self, scan):
+        self.pending = {}
+        self.ports = bytearray(8192) if scan else None
+        self.unique_port_count = 0
+        self.matching_event_count = 0
+        self.first_timestamp = None
+        self.last_timestamp = None
+        self.first_event_id = None
+        self.last_event_id = None
+        self.threshold_timestamp = None
+        self.evidence = {}  # First max_event_ids - 2 UUIDs; reserve endpoints.
+        self.recent_ids = OrderedDict()
+
+    @property
+    def active(self):
+        return self.threshold_timestamp is not None
+
+    def observe(self, event, rule):
+        # Bounded replay protection, not an unbounded lifetime UUID index.
+        if (event.event_id in self.recent_ids or event.event_id in self.evidence
+                or event.event_id in (self.first_event_id, self.last_event_id)
+                or (not self.active and event.event_id in self.pending)):
+            return False
+        self.recent_ids[event.event_id] = None
+        if len(self.recent_ids) > rule.max_event_ids:
+            self.recent_ids.popitem(last=False)
+        if len(self.evidence) < rule.max_event_ids - 2:
+            self.evidence[event.event_id] = None
+        self.matching_event_count += 1
+        if self.first_timestamp is None or event.timestamp < self.first_timestamp:
+            self.first_timestamp, self.first_event_id = event.timestamp, event.event_id
+        if self.last_timestamp is None or event.timestamp >= self.last_timestamp:
+            self.last_timestamp, self.last_event_id = event.timestamp, event.event_id
+        if self.ports is not None:
+            index, bit = divmod(event.dst_port, 8)
+            mask = 1 << bit
+            if not self.ports[index] & mask:
+                self.ports[index] |= mask
+                self.unique_port_count += 1
+        if not self.active:
+            sample_key = event.dst_port if self.ports is not None else event.event_id
+            previous = self.pending.get(sample_key)
+            if previous is None or event.timestamp >= previous:
+                self.pending[sample_key] = event.timestamp
+        return True
+
+    def event_ids(self):
+        return tuple(dict.fromkeys((*self.evidence, self.first_event_id, self.last_event_id)))
+
+
 class _Runtime:
     def __init__(self, rule):
         self.rule = rule
         self.groups = OrderedDict()
+        self.closed_before = OrderedDict()
 
     def _alert(self, timestamp, event_ids, metadata):
         rule = self.rule
@@ -27,52 +86,111 @@ class _Runtime:
                      source_event_ids=tuple(event_ids), event_category=rule.category,
                      metadata=metadata)
 
-    def _expire(self, cutoff):
-        for key, samples in list(self.groups.items()):
-            for sample_key, (timestamp, _) in list(samples.items()):
-                if timestamp <= cutoff:
-                    del samples[sample_key]
-            if not samples:
+    def _finish(self, key, timestamp, reason):
+        session = self.groups.pop(key)  # Release state even if alert construction fails.
+        self.closed_before[key] = timestamp
+        self.closed_before.move_to_end(key)
+        if len(self.closed_before) > self.rule.max_groups:
+            self.closed_before.popitem(last=False)
+        rule = self.rule
+        event_ids = session.event_ids()
+        metadata = {
+            "src_ip": key[0], "dst_ip": key[1], "threshold": rule.threshold,
+            "window_ns": rule.window_ns, "quiet_ns": rule.quiet_ns,
+            "max_detection_ns": rule.max_detection_ns,
+            "matching_event_count": session.matching_event_count,
+            "first_timestamp": session.first_timestamp,
+            "threshold_timestamp": session.threshold_timestamp,
+            "last_timestamp": session.last_timestamp,
+            "duration_ns": session.last_timestamp - session.first_timestamp,
+            "first_event_id": session.first_event_id, "last_event_id": session.last_event_id,
+            "source_event_ids_truncated": session.matching_event_count > len(event_ids),
+            "finalization_reason": reason,
+        }
+        if session.ports is not None:
+            metadata["unique_port_count"] = session.unique_port_count
+            metadata["destination_ports"] = [
+                port for port in range(1, 65536)
+                if session.ports[port // 8] & (1 << (port % 8))]
+        return self._alert(timestamp, event_ids, metadata)
+
+    def advance(self, watermark):
+        for key, timestamp in list(self.closed_before.items()):
+            if timestamp <= watermark - self.rule.window_ns:
+                del self.closed_before[key]
+        alerts = []
+        for key, session in list(self.groups.items()):
+            if session.active:
+                # A delayed event can confirm an already quiet historical run.
+                # Its alert must never predate the observed confirmation.
+                quiet_end = max(session.last_timestamp + self.rule.quiet_ns,
+                                session.threshold_timestamp)
+                maximum_end = session.threshold_timestamp + self.rule.max_detection_ns
+                deadline = min(quiet_end, maximum_end)
+                if watermark >= deadline:
+                    reason = "quiet" if quiet_end <= maximum_end else "max_duration"
+                    alerts.append(self._finish(key, deadline, reason))
+            else:
+                cutoff = watermark - self.rule.window_ns
+                for sample_key, timestamp in list(session.pending.items()):
+                    if timestamp <= cutoff:
+                        del session.pending[sample_key]
+                if not session.pending:
+                    del self.groups[key]
+        return alerts
+
+    def flush(self, watermark, reason):
+        alerts = []
+        for key, session in list(self.groups.items()):
+            if session.active:
+                alerts.append(self._finish(key, watermark, reason))
+            else:
                 del self.groups[key]
+        return alerts
 
     def evaluate(self, event, watermark):
         rule = self.rule
+        alerts = self.advance(watermark)
         if rule.category != "network":
-            return self._host(event)
-        cutoff = watermark - rule.window_ns
-        # Prune all groups even when this event belongs to an unrelated category.
-        self._expire(cutoff)
-        if event.event_category != "network" or event.timestamp <= cutoff:
-            return None
+            alert = self._host(event)
+            return alerts + ([alert] if alert is not None else [])
+        if event.event_category != "network":
+            return alerts
         if event.protocol == "OTHER" or event.src_ip == "0.0.0.0" or event.dst_ip == "0.0.0.0":
-            return None
+            return alerts
         if rule.type in ("port_scan", "syn_flood"):
-            # TCP connection attempts: SYN set, ACK clear. Ignore unavailable ports.
             if event.protocol != "TCP" or event.tcp_flags & 0x12 != 0x02 or not event.dst_port:
-                return None
+                return alerts
         key = (event.src_ip, event.dst_ip)
-        if key not in self.groups:
+        session = self.groups.get(key)
+        if event.timestamp < self.closed_before.get(key, 0):
+            return alerts
+        # Pending samples must be in the confirmation window. Active sessions
+        # may include late activity from their observed lifetime, even if it is
+        # outside that window; no old input may create/reopen a closed session.
+        if session is not None and session.active:
+            if (event.timestamp < session.first_timestamp
+                    and event.timestamp <= watermark - rule.window_ns):
+                return alerts
+        elif event.timestamp <= watermark - rule.window_ns:
+            return alerts
+        if session is None:
             if len(self.groups) >= rule.max_groups:
-                self.groups.popitem(last=False)
-            self.groups[key] = {}
-        samples = self.groups[key]
+                # Never discard a confirmed session or force an early alert for
+                # capacity. Prefer evicting the oldest unconfirmed candidate.
+                victim = next((key for key, value in self.groups.items() if not value.active), None)
+                if victim is None:
+                    return alerts
+                del self.groups[victim]
+            session = _Session(rule.type == "port_scan")
+            self.groups[key] = session
         self.groups.move_to_end(key)
-        sample_key = event.dst_port if rule.type == "port_scan" else event.event_id
-        previous = samples.get(sample_key)
-        if previous is None or event.timestamp >= previous[0]:
-            samples[sample_key] = (event.timestamp, event.event_id)
-        if len(samples) < rule.threshold:
-            return None
-        ordered = sorted(samples.values(), key=lambda sample: sample[0])
-        metadata = {"src_ip": key[0], "dst_ip": key[1], "count": len(samples),
-                    "threshold": rule.threshold, "window_ns": rule.window_ns,
-                    "first_timestamp": ordered[0][0], "last_timestamp": ordered[-1][0]}
-        if rule.type == "port_scan":
-            metadata["destination_ports"] = sorted(samples)
-        # Reset before output construction, so a failed rule cannot accumulate
-        # more than threshold samples in its group. No persistent alert cache.
-        del self.groups[key]
-        return self._alert(watermark, [event_id for _, event_id in ordered], metadata)
+        if session.observe(event, rule) and not session.active and len(session.pending) >= rule.threshold:
+            session.threshold_timestamp = watermark
+            session.pending.clear()
+            # A late packet can confirm activity that is already quiet.
+            alerts.extend(self.advance(watermark))
+        return alerts
 
     def _host(self, event):
         rule = self.rule
@@ -101,8 +219,9 @@ class RuleEngine:
 
     evaluate returns alerts. __call__ also publishes them to alert subscribers
     and isolates failures so detection cannot interrupt other pipeline consumers.
-    Event-time windows use a nondecreasing high watermark. Late network events
-    inside the window are accepted; events at/before its cutoff are ignored.
+    Event-time windows/sessions use a nondecreasing high watermark. advance_time
+    returns timer alerts; tick publishes them. flush publishes remaining active
+    sessions on stream termination. No background thread or wall-clock dependency.
     """
 
     def __init__(self, rules):
@@ -129,19 +248,25 @@ class RuleEngine:
         alerts = []
         for runtime in self._runtimes:
             try:
-                alert = runtime.evaluate(SecurityEvent.from_dict(snapshot.to_dict()), self._watermark)
-                if alert is not None:
-                    alerts.append(alert)
+                alerts.extend(runtime.evaluate(SecurityEvent.from_dict(snapshot.to_dict()), self._watermark))
             except Exception:
                 logger.exception("Rule %s failed for event %s", runtime.rule.id, snapshot.event_id)
         return alerts
 
-    def __call__(self, event):
-        try:
-            alerts = self.evaluate(event)
-        except Exception:
-            logger.exception("Rule engine failed; continuing event pipeline")
-            return []
+    def advance_time(self, timestamp):
+        """Advance sensor monotonic time without an event; return finalized alerts."""
+        if type(timestamp) is not int or not 0 <= timestamp < (1 << 64):
+            raise ValueError("invalid rule clock timestamp")
+        self._watermark = max(self._watermark, timestamp)
+        alerts = []
+        for runtime in self._runtimes:
+            try:
+                alerts.extend(runtime.advance(self._watermark))
+            except Exception:
+                logger.exception("Rule %s timer failed", runtime.rule.id)
+        return alerts
+
+    def _publish(self, alerts):
         for alert in alerts:
             for consumer in tuple(self._subscribers):
                 try:
@@ -149,3 +274,30 @@ class RuleEngine:
                 except Exception:
                     logger.exception("Alert subscriber failed for rule %s", alert.rule_id)
         return alerts
+
+    def tick(self, timestamp):
+        """Failure-contained timer subscriber; also publishes finalized alerts."""
+        try:
+            return self._publish(self.advance_time(timestamp))
+        except Exception:
+            logger.exception("Rule engine timer failed; continuing event pipeline")
+            return []
+
+    def flush(self, reason="stream_end"):
+        """Publish confirmed sessions once; discard unconfirmed candidates."""
+        if reason not in ("stream_end", "shutdown"):
+            raise ValueError("invalid rule flush reason")
+        alerts = []
+        for runtime in self._runtimes:
+            try:
+                alerts.extend(runtime.flush(self._watermark, reason))
+            except Exception:
+                logger.exception("Rule %s flush failed", runtime.rule.id)
+        return self._publish(alerts)
+
+    def __call__(self, event):
+        try:
+            return self._publish(self.evaluate(event))
+        except Exception:
+            logger.exception("Rule engine failed; continuing event pipeline")
+            return []

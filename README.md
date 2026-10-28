@@ -361,25 +361,94 @@ SYN/ACKs and unavailable port defaults do not count as connection attempts.
 rules. Traffic flood includes TCP, UDP, ICMP, and other reported IPv4 protocols.
 
 Network rules require `threshold` (integer 1–4096) and `window_seconds` (a finite
-positive number representing 1 ns through 86400 seconds). `max_groups` defaults
-to 128 and must be 1–4096. No host `match` selectors apply to network rules.
-Windows use the original monotonic nanosecond timestamps, not wall time, with a
-nondecreasing high watermark across all consumed events. Samples at or before
-`watermark - window` expire; late samples inside the window are accepted. Every
-event, including host events, prunes expired network groups. During complete
-input inactivity, state remains bounded until the next event advances the clock.
+positive number representing 1 ns through 86400 seconds). They also accept:
 
-Each group retains fewer than `threshold` samples between evaluations: one most
-recent attempt per destination port for scans, or one per event ID for floods.
-At threshold the engine emits one alert and clears the batch, allowing subsequent
-nonoverlapping batches to alert. Repeated ports alone cannot trigger a scan.
-Network evidence contains original event IDs, observed count, threshold, window,
-source/destination IPs, and first/last sample timestamps (plus destination ports
-for scans). The alert timestamp is the watermark at threshold. A rule retains
-at most `max_groups * threshold` samples during evaluation; reaching the group
-limit evicts the least recently accessed group. Capacity eviction can miss a
-threshold under high source cardinality. No persistent deduplication or replay
-cache exists across completed batches. A new engine starts with empty state.
+```yaml
+threshold: 10
+window_seconds: 5
+quiet_seconds: 3
+max_detection_seconds: 60
+max_event_ids: 64
+max_groups: 128
+```
+
+`quiet_seconds` defaults to 3 and `max_detection_seconds` to 60; both have the
+same positive finite duration bounds as `window_seconds`. Older configurations
+receive these defaults. As a configuration consistency requirement, the maximum
+duration must be at least both `window_seconds` and `quiet_seconds`; shorter
+values raise `RuleConfigError`. The active lifetime still starts at confirmation,
+not at the first candidate packet. `max_event_ids` is 2–256 (default 64), and `max_groups`
+is 1–4096 (default 128). No host `match` selectors apply to network rules.
+
+Each rule maintains independent sessions keyed by `(src_ip, dst_ip)`. Before
+confirmation, a sliding window retains the most recent timestamp per distinct
+port for scans, or one timestamp per packet ID for floods. Samples at or before
+`watermark - window` expire. Confirmation requires `threshold` distinct scan
+ports or matching flood packets inside that window. Repeated attempts to one
+port do not confirm a scan. Candidates disappear without alerting when their
+entire window expires. For a continuously observed candidate, aggregate totals
+and first/last timestamps include activity from its beginning, even if older
+confirmation samples have expired.
+
+At threshold the session becomes active **without emitting an alert**. It keeps
+accumulating complete activity totals and distinct ports, independently of the
+confirmation window. Every matching packet, including a repeated scan port,
+updates its last-activity timestamp; unrelated packets and SYN/ACKs do not.
+Exactly one final alert is emitted when either the quiet deadline or maximum
+active duration is reached. The maximum duration starts at `threshold_timestamp`.
+A packet at a deadline closes the old session before starting a new candidate.
+Continued traffic can therefore start a new session after a maximum-duration
+boundary, rather than after every threshold-sized batch.
+
+Network alert metadata contains `matching_event_count` for total observed matching
+packets, `first_timestamp`, `threshold_timestamp`, `last_timestamp`, `duration_ns`
+(last minus first, excluding the quiet wait), thresholds/durations, IPs, endpoint
+UUIDs, and `finalization_reason` (`quiet` or `max_duration`). Scan alerts additionally
+contain the exact `unique_port_count` and complete sorted `destination_ports`.
+There is no ambiguous `count` field. Alert `timestamp` is the finalization deadline;
+it never predates confirmation, including when a late event confirms old activity.
+
+Memory remains bounded. Pending confirmation retains fewer than `threshold`
+samples between evaluations; active sessions retain no per-packet window history.
+Scans use a fixed 8192-byte bitmap covering every possible destination port, so
+neither the final unique count nor port list is truncated. Each session keeps at
+most `max_event_ids` sampled source UUIDs (including the first/last observed event)
+and a recent-UUID cache of the same bound. `source_event_ids_truncated` explicitly
+indicates sampled evidence. Counts continue growing after the UUID cap is reached;
+there is no unbounded UUID/history collection. Recent replayed IDs are ignored,
+but arbitrary old replays outside the bounded cache cannot be fully deduplicated.
+M6 supplies a fresh UUID for each actual collected event.
+
+The group limit applies across pending and active sessions. At capacity the oldest
+pending candidate is evicted first. If all groups are active, new IP pairs are
+ignored until space becomes available; active evidence is never silently discarded
+or finalized early to make room. This can miss new sources at capacity. A separate
+closed-session boundary cache is capped at `max_groups` and expires with the
+confirmation window, preventing recent delayed packets from reopening old sessions
+while their boundary remains retained.
+
+The engine uses original monotonic nanosecond timestamps and a nondecreasing high
+watermark. Every event can advance finalization, even an unrelated host event.
+For deterministic offline consumers, `engine.advance_time(timestamp)` returns
+finalized alerts without publishing; `engine.tick(timestamp)` also publishes them
+and contains timer/sink failures. Pass time in the same monotonic clock domain as
+the events. With only `evaluate()` and no later input/tick, event time does not
+advance and quiet sessions remain pending; the next watermark advance finalizes
+them. The rule engine never sleeps or reads a system clock itself.
+Backward time cannot reopen or extend a session. Late matching input
+inside a retained session can contribute without regressing its last timestamp.
+
+The live receiver polls idle sockets (at most 250 ms between polls, with a 1 ms
+minimum for very small configured durations) and calls `tick(time.monotonic_ns())`.
+On Linux this clock matches the sensors' `bpf_ktime_get_ns()`. A quiet stream
+therefore finalizes alerts while the agent remains connected, without waiting for
+another packet. Polling preserves partial newline-delimited JSON records and does
+not change the receiver's default blocking behavior when rules are disabled.
+`engine.flush()` publishes remaining confirmed sessions at end-of-stream and
+clears candidates; repeated flushes do not duplicate alerts. The receiver flushes
+on EOF (`finalization_reason: stream_end`) or Ctrl-C/error cleanup (`shutdown`),
+explicitly marking these early finalizations rather than claiming a quiet timeout.
+Host matching/alert timing, SQLite, and API behavior are unchanged.
 
 Host rules require nonempty `match` conditions. Each field is a nonempty list
 of exact accepted values; values within a list use OR, different fields use AND.
