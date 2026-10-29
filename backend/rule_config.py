@@ -9,10 +9,6 @@ from typing import Mapping
 
 import yaml
 
-if __package__:
-    from .alerts import SEVERITIES
-else:
-    from alerts import SEVERITIES
 
 MAX_CONFIG_BYTES = 262144
 MAX_RULES = 128
@@ -75,7 +71,7 @@ class Rule:
     enabled: bool
     category: str
     type: str
-    severity: str
+    base_score: int | None
     description: str
     match: Mapping[str, tuple[str | int, ...] | bool]
     threshold: int = 0
@@ -89,7 +85,7 @@ class Rule:
 def _parse_rule(raw):
     if not isinstance(raw, dict):
         raise RuleConfigError("each rule must be an object")
-    common = {"id", "name", "enabled", "category", "type", "severity", "description"}
+    common = {"id", "name", "enabled", "category", "type", "description"}
     if not common <= raw.keys():
         raise RuleConfigError("rule missing required fields")
     rule_type = _text(raw["type"], "type")
@@ -100,13 +96,12 @@ def _parse_rule(raw):
         raise RuleConfigError("invalid rule ID")
     if type(raw["enabled"]) is not bool:
         raise RuleConfigError("enabled must be a boolean")
-    if raw["severity"] not in SEVERITIES:
-        raise RuleConfigError("invalid static severity")
     values = {key: raw[key] for key in common}
+    values["base_score"] = _integer(raw["base_score"], 0, 100, "base_score") if "base_score" in raw else None
     values["name"] = _text(raw["name"], "name", 200)
     values["description"] = _text(raw["description"], "description")
     network = raw["category"] == "network"
-    allowed = common | ({"threshold", "window_seconds", "max_groups", "quiet_seconds",
+    allowed = common | {"base_score"} | ({"threshold", "window_seconds", "max_groups", "quiet_seconds",
                          "max_detection_seconds", "max_event_ids"} if network else {"match"})
     if raw.keys() - allowed:
         raise RuleConfigError("unknown rule fields")

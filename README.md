@@ -3,7 +3,7 @@
 KernelLens is a real-time eBPF-based telemetry framework for hybrid host and network threat detection.
 
 ## Current Milestone
-M8 - Rule Engine
+M9 - Scoring and Severity
 
 The C XDP program sends packet events through a BPF ring buffer to a C
 libbpf agent. Every packet returns `XDP_PASS`, including when the ring buffer
@@ -309,7 +309,7 @@ the receiver does not import PyYAML. The engine runs in Python, with no C/eBPF,
 SQLite schema, or API changes.
 
 `backend/alerts.py` defines `Alert` with a UUID4 `alert_id`, sensor-time
-`timestamp`, `rule_id`, `rule_name`, `alert_type`, configured `severity`,
+`timestamp`, `rule_id`, `rule_name`, `alert_type`, score-derived `severity`,
 `description`, `source_event_ids`, `event_category`, and JSON-compatible
 `metadata`. Alerts are returned by `RuleEngine.evaluate(event)`. Register
 callbacks with `engine.subscribe(consumer)`, then register the engine itself as
@@ -337,9 +337,9 @@ policy. Alerts/state are not stored in SQLite or exposed through new API routes.
 No alert history is retained internally; callers can consume returned alerts.
 
 Rules use `schema_version: 1` and a `rules` list in YAML. Every entry requires
-`id`, `name`, `enabled` (boolean), `category`, `type`, `severity`, and `description`.
-IDs must be unique, including disabled entries. Static severity is one of
-`info`, `low`, `medium`, `high`, or `critical`; there is no risk score.
+`id`, `name`, `enabled` (boolean), `category`, `type`, and `description`.
+IDs must be unique, including disabled entries. Optional `base_score` overrides
+the family base in M9; old `severity` keys are rejected.
 `backend/rule_config.py` uses a restricted [PyYAML SafeLoader](https://pyyaml.org/wiki/PyYAMLDocumentation)
 with duplicate-key rejection. Unknown fields, malformed selectors, unsupported
 category/type pairs, duplicate IDs, and invalid numeric values are errors.
@@ -469,7 +469,7 @@ a SYN flood rule, EPERM (`syscall_return: [-1]`) credential-syscall monitoring,
 and a real UID transition to root. It does not flag every syscall or credential
 change. Process and traffic-flood examples are disabled for local configuration;
 thresholds and policy choices should be tuned to the intended environment.
-There is no dynamic severity/scoring, correlation, incident handling, WebSocket,
+M9 adds deterministic scoring below. There is no correlation, incident handling, WebSocket,
 frontend, enrichment, or response action in M8.
 
 Run all non-privileged parser, validation, storage/API, rule, and C IPC tests:
@@ -512,3 +512,126 @@ Only the test child drops its own credentials to UID/GID 65534 (GID 65533 if
 already 65534); the shell and agent retain theirs. The test snapshots only the
 agent's BPF program IDs and verifies they are unloaded after exit, checks socket
 cleanup, and repeats the M4 TCP/UDP traffic tests while host sensing is enabled.
+
+## Scoring and severity (M9)
+
+Scoring happens in `backend/scoring.py` when each rule constructs its final Alert.
+Network evidence is scored only after session finalization, including quiet,
+maximum-duration, and stream termination paths. Host matches score immediately.
+No transport, SQLite, API, eBPF, or C-agent scoring logic is added. Alerts remain
+in memory/output; no alert persistence, correlation, or incidents are introduced.
+
+`config/scoring.yaml` is the default versioned scoring policy, resolved relative
+to the repository package rather than the working directory. To select another:
+
+```bash
+.venv/bin/python backend/receiver.py SOCKET --rules config/rules.yaml --scoring config/scoring.yaml
+```
+
+| Family | Base | Rationale |
+| --- | --- | --- |
+| port_scan | 30 | Reconnaissance is suspicious, but does not establish compromise |
+| syn_flood | 60 | Connection-attempt volume can disrupt availability |
+| traffic_flood | 50 | High traffic merits investigation but can be legitimate |
+| process_match | 30 | A configured name/path match alone is limited evidence |
+| syscall_match | 20 | The default policy detects denied credential calls, not successful escalation |
+| privilege_change | 50 | An actual credential change warrants greater attention |
+
+Each rule can optionally set an integer `base_score` from 0–100 for its specific
+context. For port scans, the scoring policy is authoritative: a per-rule base
+override must equal its configured base score or scoring rejects it. Policy base
+scores remain in 20–49, and selected tiers are absolute scores.
+M8 `severity` fields have been removed and are rejected, not silently
+interpreted as final severity. Customize policy/overrides for local host rules.
+
+Port scans have a separate absolute scale based only on `unique_port_count`:
+
+| Unique ports | Risk score | Severity |
+| --- | --- | --- |
+| 1–19 (including the default detection threshold of 10) | 30 | medium |
+| 20–49 | 35 | medium |
+| 50–99 | 40 | medium |
+| 100–199 | 45 | medium |
+| 200–65535 | 49 | medium |
+
+Reconnaissance volume alone does not establish compromise or availability impact,
+so it cannot produce high/critical scan severity. Detection thresholds still
+control whether a session is confirmed, but do not scale its risk score. The YAML
+entry under `scoring` is:
+
+```yaml
+port_scan:
+  base_score: 30
+  tiers:
+    - {min_unique_ports: 20, score: 35}
+    - {min_unique_ports: 50, score: 40}
+    - {min_unique_ports: 100, score: 45}
+    - {min_unique_ports: 200, score: 49}
+```
+
+The highest matching tier supplies the absolute score. An explanatory
+`port_scan_scope` modifier records the difference from the base score; tiers do
+not stack. Port-scan policies require 1–8 tiers, strictly increasing integer
+port thresholds (2–65535), and nondecreasing integer scores from the base upward.
+Base and tier scores are restricted to 20–49. Unknown/duplicate fields, booleans,
+malformed tiers, decreasing thresholds/scores, and scores above 49 are rejected.
+
+SYN and traffic floods retain their original highest-matching volume tier: +10
+at 2 times threshold or +20 at 5 times threshold, using `matching_event_count`.
+Comparisons use integer multiplication and exclusive tiers prevent stacking.
+Privilege changes add +25 only when evidence shows an effective UID transition
+from nonzero to zero; root remaining root while GID changes gets no root bonus.
+There are no process/syscall bonuses, duration bonuses, or cross-alert modifiers.
+
+The final score is `max(0, min(100, base_score + sum(modifier points)))`.
+Severity is derived exclusively from the final integer score:
+
+| Score | Severity |
+| --- | --- |
+| 0–19 | low |
+| 20–49 | medium |
+| 50–79 | high |
+| 80–100 | critical |
+
+Alerts expose `risk_score`, `base_score`, `score_modifiers` (name, signed points,
+and evidence-based reason), and `severity`. Validation rejects booleans/floats
+as scores, out-of-range scores, inconsistent arithmetic, and mismatched severity.
+UUID generation does not influence scoring; identical evidence and policy always
+produce the same score/explanation. Scoring copies metadata and snapshots policy.
+
+Example projection of a final 50-port scan alert with threshold 10:
+
+```json
+{
+  "alert_type": "port_scan",
+  "risk_score": 40,
+  "base_score": 30,
+  "severity": "medium",
+  "score_modifiers": [
+    {"name": "port_scan_scope", "points": 10, "reason": "unique_port_count=50 falls in the 50-99 port tier"}
+  ],
+  "metadata": {"unique_port_count": 50, "threshold": 10}
+}
+```
+
+The actual alert retains the complete M8 metadata and sampled source IDs.
+Calculation: 50 ports selects the 50–99 tier with score 40. The explanation
+records base 30 plus scope adjustment 10 = 40/medium. A 1000-port scan remains
+49/medium. A threshold-level
+SYN flood is 60/high; a 5x SYN flood is 80/critical. A UID change to root is
+50 + 25 = 75/high, compared with a generic credential change at 50/high.
+
+Scoring YAML requires exactly all six families, their base scores, port-scan `tiers`, flood
+`volume_tiers`, and privilege `root_uid_points`. Unknown/missing fields and
+duplicate YAML keys fail startup with `RuleConfigError`. Base scores are 0–100;
+modifier points are signed integers in −100–100. Negative adjustments are allowed
+for explicit local policy discounts, although defaults only increase risk.
+Flood tiers are limited to eight, with strictly increasing integer multiples
+from 2–1000. The file has the same 256 KiB limit and restricted SafeLoader as
+rules. New policy instances are required to apply changes; there is no hot reload.
+
+Run M9 tests with:
+
+```bash
+.venv/bin/python -m unittest discover -s tests -p test_scoring.py -v
+```

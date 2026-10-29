@@ -1,0 +1,26 @@
+schema_version: 1
+scoring:
+  port_scan:
+    base_score: 30
+    tiers:
+      - {min_unique_ports: 20, score: 35}
+      - {min_unique_ports: 50, score: 40}
+      - {min_unique_ports: 100, score: 45}
+      - {min_unique_ports: 200, score: 49}
+  syn_flood:
+    base_score: 60
+    volume_tiers:
+      - {multiple: 2, points: 10}
+      - {multiple: 5, points: 20}
+  traffic_flood:
+    base_score: 50
+    volume_tiers:
+      - {multiple: 2, points: 10}
+      - {multiple: 5, points: 20}
+  process_match:
+    base_score: 30
+  syscall_match:
+    base_score: 20
+  privilege_change:
+    base_score: 50
+    root_uid_points: 25

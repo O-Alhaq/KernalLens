@@ -11,7 +11,6 @@ rules:
     max_detection_seconds: 60
     max_event_ids: 64
     max_groups: 128
-    severity: medium
     description: TCP SYN attempts from one source to ten distinct ports on one destination.
 
   - id: syn_flood_basic
@@ -25,7 +24,6 @@ rules:
     max_detection_seconds: 60
     max_event_ids: 64
     max_groups: 128
-    severity: high
     description: One source sent at least 1000 TCP SYN attempts to one destination in five seconds.
 
   - id: traffic_flood_example
@@ -39,7 +37,6 @@ rules:
     max_detection_seconds: 60
     max_event_ids: 64
     max_groups: 128
-    severity: medium
     description: Example volume rule; enable and tune for the observed network.
 
   - id: process_example
@@ -49,7 +46,6 @@ rules:
     type: process_match
     match:
       process_name: [example-tool]
-    severity: low
     description: Example process selector; configure a locally relevant name before enabling.
 
   - id: denied_credential_syscall
@@ -60,7 +56,6 @@ rules:
     match:
       syscall: [setuid, setgid]
       syscall_return: [-1]
-    severity: low
     description: A monitored credential syscall returned EPERM; investigate according to local policy.
 
   - id: uid_change_to_root
@@ -71,5 +66,4 @@ rules:
     match:
       uid: [0]
       uid_changed: true
-    severity: high
     description: A successful monitored syscall changed a non-root effective UID to root.

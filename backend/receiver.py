@@ -59,7 +59,10 @@ def main():
     parser.add_argument("socket_path", help="Unix socket exposed by the C agent")
     parser.add_argument("--database", help="persist normalized events to this SQLite file")
     parser.add_argument("--rules", help="evaluate rules from this YAML file; alerts go to stderr")
+    parser.add_argument("--scoring", help="scoring YAML policy (requires --rules)")
     arguments = parser.parse_args()
+    if arguments.scoring and not arguments.rules:
+        parser.error("--scoring requires --rules")
     engine = None
     finish_reason = "shutdown"
     try:
@@ -68,11 +71,13 @@ def main():
             if __package__:
                 from .rule_config import load_rules
                 from .rules import RuleEngine
+                from .scoring import Scorer
             else:
                 from rule_config import load_rules
                 from rules import RuleEngine
+                from scoring import Scorer
             rules = load_rules(arguments.rules)
-            engine = RuleEngine(rules)
+            engine = RuleEngine(rules, scorer=Scorer.from_file(arguments.scoring))
             engine.subscribe(lambda alert: print(
                 "Alert: " + json.dumps(alert.to_dict(), separators=(",", ":")),
                 file=sys.stderr, flush=True))

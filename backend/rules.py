@@ -4,11 +4,11 @@ from collections import OrderedDict
 import logging
 
 if __package__:
-    from .alerts import Alert
+    from .scoring import Scorer
     from .events import SecurityEvent
     from .rule_config import MAX_RULES, Rule
 else:
-    from alerts import Alert
+    from scoring import Scorer
     from events import SecurityEvent
     from rule_config import MAX_RULES, Rule
 
@@ -74,15 +74,16 @@ class _Session:
 
 
 class _Runtime:
-    def __init__(self, rule):
+    def __init__(self, rule, scorer):
         self.rule = rule
+        self.scorer = scorer
         self.groups = OrderedDict()
         self.closed_before = OrderedDict()
 
     def _alert(self, timestamp, event_ids, metadata):
         rule = self.rule
-        return Alert(timestamp=timestamp, rule_id=rule.id, rule_name=rule.name,
-                     alert_type=rule.type, severity=rule.severity, description=rule.description,
+        return self.scorer.alert(base_override=rule.base_score, timestamp=timestamp, rule_id=rule.id, rule_name=rule.name,
+                     alert_type=rule.type, description=rule.description,
                      source_event_ids=tuple(event_ids), event_category=rule.category,
                      metadata=metadata)
 
@@ -224,13 +225,14 @@ class RuleEngine:
     sessions on stream termination. No background thread or wall-clock dependency.
     """
 
-    def __init__(self, rules):
+    def __init__(self, rules, scorer=None):
         rules = tuple(rules)
         if len(rules) > MAX_RULES or any(not isinstance(rule, Rule) for rule in rules):
             raise ValueError("engine requires validated rules")
         if len({rule.id for rule in rules}) != len(rules):
             raise ValueError("duplicate rule IDs")
-        self._runtimes = [_Runtime(rule) for rule in rules if rule.enabled]
+        scorer = scorer if scorer is not None else Scorer.from_file()
+        self._runtimes = [_Runtime(rule, scorer) for rule in rules if rule.enabled]
         self._watermark = 0
         self._subscribers = []
 

@@ -29,7 +29,7 @@ def rule(kind="port_scan", **overrides):
     category = {"process_match": "process", "syscall_match": "syscall",
                 "privilege_change": "privilege"}.get(kind, "network")
     result = {"id": kind, "name": f"Test {kind}", "enabled": True,
-              "category": category, "type": kind, "severity": "medium",
+              "category": category, "type": kind, "base_score": 30 if kind == "port_scan" else 35,
               "description": "Configured test condition"}
     if category == "network":
         result.update(threshold=3, window_seconds=5, max_groups=4)
@@ -90,7 +90,7 @@ class ConfigurationTests(unittest.TestCase):
 
     def test_invalid_rules_are_rejected_including_disabled_entries(self):
         bad_values = [rule(id="bad id"), rule(enabled="false"), rule(enabled=1),
-                      rule(severity="urgent"), rule(type="unknown"), rule(category="process"),
+                      rule(base_score="urgent"), rule(type="unknown"), rule(category="process"),
                       rule(threshold=0), rule(threshold=True), rule(threshold=4097),
                       rule(threshold=1.5), rule(window_seconds=0), rule(window_seconds=True),
                       rule(window_seconds=float("nan")), rule(window_seconds=float("inf")),
@@ -201,10 +201,10 @@ class HostRuleTests(unittest.TestCase):
         self.assertEqual([alert.rule_id for alert in detector.evaluate(host("syscall"))],
                          ["denied_credential_syscall"])
 
-    def test_alert_structure_static_severity_unique_ids_and_event_immutability(self):
+    def test_alert_structure_scored_severity_unique_ids_and_event_immutability(self):
         event = host("privilege", uid=0, previous_uid=1000)
         before = event.to_dict()
-        detector = engine(rule("privilege_change", severity="high"))
+        detector = engine(rule("privilege_change", base_score=50))
         first, second = detector.evaluate(event)[0], detector.evaluate(event)[0]
         self.assertIsInstance(first, Alert)
         self.assertEqual(UUID(first.alert_id).version, 4)
