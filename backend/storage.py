@@ -10,7 +10,7 @@ if __package__:
 else:
     from events import SecurityEvent
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 COLUMNS = tuple(item.name for item in fields(SecurityEvent))
 COLUMN_SQL = ", ".join(COLUMNS)
 
@@ -43,6 +43,23 @@ CREATE TABLE events (
 )
 """
 
+# Full Alert snapshots preserve the scored evidence behind each incident link.
+# Existing event rows and their schema are unchanged by migration 2.
+MIGRATION_2 = (
+    "CREATE TABLE alerts (alert_id TEXT PRIMARY KEY NOT NULL, record TEXT NOT NULL)",
+    """CREATE TABLE incidents (
+        incident_id TEXT PRIMARY KEY NOT NULL,
+        incident_type TEXT NOT NULL,
+        severity TEXT NOT NULL,
+        record TEXT NOT NULL)""",
+    """CREATE TABLE incident_alerts (
+        incident_id TEXT NOT NULL REFERENCES incidents(incident_id),
+        alert_id TEXT NOT NULL REFERENCES alerts(alert_id),
+        PRIMARY KEY (incident_id, alert_id))""",
+    "CREATE INDEX incidents_type ON incidents(incident_type)",
+    "CREATE INDEX incidents_severity ON incidents(severity)",
+)
+
 
 def validate_pagination(limit, offset):
     if type(limit) is not int or not 1 <= limit <= 1000:
@@ -68,25 +85,29 @@ class EventStore:
     def _connection(self):
         connection = sqlite3.connect(self.path, timeout=5)
         connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA foreign_keys=ON")
         try:
             yield connection
         finally:
             connection.close()
 
     def initialize(self):
-        """Apply v1 atomically, tolerate repeat startup, reject newer schemas."""
+        """Apply v1/v2 atomically, tolerate repeat startup, reject newer schemas."""
         with self._connection() as connection:
             connection.execute("PRAGMA journal_mode=WAL")
             with connection:
                 connection.execute("BEGIN IMMEDIATE")
                 version = connection.execute("PRAGMA user_version").fetchone()[0]
-                if version not in (0, SCHEMA_VERSION):
+                if version not in (0, 1, SCHEMA_VERSION):
                     raise ValueError(f"unsupported database schema version: {version}")
                 if version == 0:
                     connection.execute(MIGRATION_1)
                     connection.execute("CREATE INDEX events_category ON events(event_category)")
                     connection.execute("CREATE INDEX events_type ON events(event_type)")
-                    connection.execute("PRAGMA user_version=1")
+                if version < 2:
+                    for statement in MIGRATION_2:
+                        connection.execute(statement)
+                    connection.execute("PRAGMA user_version=2")
 
     def insert(self, event):
         if not isinstance(event, SecurityEvent):

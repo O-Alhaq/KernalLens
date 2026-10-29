@@ -1,4 +1,6 @@
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
 #include "ipc.h"
 
 #include <arpa/inet.h>
@@ -16,23 +18,49 @@ static void disconnect_client(struct ipc_server *server)
     if (server->client >= 0)
         close(server->client);
     server->client = -1;
+    server->pending_length = 0;
 }
 
-/* A partial write cannot be followed by another JSON record: disconnect so the
- * receiver can reject the truncated record. Never wait for a slow consumer. */
+/* Preserve every queued byte, including a partially sent record's suffix.
+ * Work per invocation is bounded; the existing main loop retries during idle. */
+static void flush_pending(struct ipc_server *server)
+{
+    for (int attempt = 0; attempt < 16 && server->client >= 0 && server->pending_length; attempt++) {
+        ssize_t sent = send(server->client, server->pending, server->pending_length,
+                            MSG_DONTWAIT | MSG_NOSIGNAL);
+        if (sent > 0) {
+            server->pending_length -= (size_t)sent;
+            memmove(server->pending, server->pending + sent, server->pending_length);
+            continue;
+        }
+        if (sent < 0 && errno == EINTR)
+            continue;
+        if (sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
+            return;
+        int error = sent < 0 ? errno : 0;
+        fprintf(stderr, "IPC %s: send returned %zd, errno=%d (%s); closing connection.\n",
+                error == EPIPE || error == ECONNRESET ? "peer disconnected" : "fatal send error",
+                sent, error, error ? strerror(error) : "zero progress");
+        disconnect_client(server);
+        return;
+    }
+}
+
 static void send_record(struct ipc_server *server, const char *record, size_t length)
 {
-    ssize_t sent;
-
     if (server->client < 0)
         return;
-    do {
-        sent = send(server->client, record, length, MSG_DONTWAIT | MSG_NOSIGNAL);
-    } while (sent < 0 && errno == EINTR);
-    if (sent != (ssize_t)length) {
-        fprintf(stderr, "IPC receiver disconnected or too slow; closing connection.\n");
-        disconnect_client(server);
+    flush_pending(server);
+    if (server->client < 0)
+        return;
+    if (length > sizeof(server->pending) - server->pending_length) {
+        if (server->dropped_records++ == 0)
+            fprintf(stderr, "IPC send queue full; dropping whole new records, keeping receiver connected.\n");
+        return;
     }
+    memcpy(server->pending + server->pending_length, record, length);
+    server->pending_length += length;
+    flush_pending(server);
 }
 
 int ipc_open(struct ipc_server *server, const char *path)
@@ -94,6 +122,7 @@ void ipc_poll(struct ipc_server *server)
         if (received >= 0 || (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR))
             disconnect_client(server);
     }
+    flush_pending(server);
     client = accept4(server->listener, NULL, NULL, SOCK_NONBLOCK | SOCK_CLOEXEC);
     if (client < 0)
         return;
@@ -240,6 +269,8 @@ void ipc_close(struct ipc_server *server)
 {
     struct stat info;
 
+    if (server->dropped_records)
+        fprintf(stderr, "IPC dropped records: %llu\n", server->dropped_records);
     disconnect_client(server);
     if (server->listener >= 0)
         close(server->listener);

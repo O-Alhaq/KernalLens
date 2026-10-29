@@ -1,0 +1,19 @@
+schema_version: 1
+# Explicit addresses on THIS monitored host. Empty disables hybrid matching.
+# Example: [192.0.2.2]. Never infer local ownership from observed traffic.
+monitored_ips: []
+limits:
+  max_pending_alerts: 1024
+  max_open_incidents: 256
+  max_alerts_per_incident: 128
+  max_seen_alerts: 4096
+correlation:
+  network_sequence:
+    enabled: true
+    window_seconds: 60
+  host_sequence:
+    enabled: true
+    window_seconds: 30
+  hybrid_activity:
+    enabled: true
+    window_seconds: 60

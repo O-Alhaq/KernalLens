@@ -46,7 +46,11 @@ build/ipc-driver: tests/ipc_driver.c agent/ipc.c agent/ipc.h ebpf/include/event.
 build/packet-parser-test: tests/packet_parser.c ebpf/include/packet_parser.h ebpf/include/event.h | build
 	$(CC) $(CPPFLAGS) $(CFLAGS) -Wall -Wextra -Werror -Iebpf/include $< -o $@ $(LDFLAGS)
 
-test: all build/ipc-driver build/packet-parser-test
+build/ipc-backpressure-test: tests/ipc_backpressure.c agent/ipc.c agent/ipc.h | build
+	$(CC) $(CPPFLAGS) $(CFLAGS) -Wall -Wextra -Werror -Iagent -Iebpf/include $< -o $@ $(LDFLAGS)
+
+test: all build/ipc-driver build/packet-parser-test build/ipc-backpressure-test
+	./build/ipc-backpressure-test
 	./build/packet-parser-test
 	PYTHONDONTWRITEBYTECODE=1 $(PYTHON) -m unittest discover -s tests -p 'test_*.py' -v
 

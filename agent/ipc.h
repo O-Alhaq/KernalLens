@@ -6,12 +6,17 @@
 #include "event.h"
 #include "host_event.h"
 
+#define IPC_QUEUE_BYTES 65536
+
 struct ipc_server {
     int listener;
     int client;
     char path[108];
     dev_t device;
     ino_t inode;
+    char pending[IPC_QUEUE_BYTES];
+    size_t pending_length;
+    unsigned long long dropped_records;
 };
 
 int ipc_open(struct ipc_server *server, const char *path);

@@ -168,11 +168,23 @@ class TransportTests(unittest.TestCase):
         self.assertEqual(second.recv(4096), b"")
         self.assertFalse(Path(self.path).exists())
 
-    def test_slow_client_does_not_block_and_can_reconnect(self):
+    def test_slow_client_stays_connected_and_preserves_framing(self):
         client = self.connect()
-        self.command("flood")
-        while client.recv(65536):
-            pass
+        self.command("flood")  # Producer completes even while receiver reads nothing.
+        received = b""
+        for _ in range(100):
+            self.command("poll")
+            while select.select([client], [], [], 0)[0]:
+                chunk = client.recv(65536)
+                self.assertTrue(chunk, "backpressure disconnected the receiver")
+                received += chunk
+        self.assertTrue(received)
+        self.assertTrue(received.endswith(b"\n"))
+        for line in received.splitlines():
+            self.assertEqual(validate_message(json.loads(line)), EVENT)
+        self.command("event")
+        self.assertEqual(json.loads(client.recv(4096)), EVENT)
+        client.close()
         self.connect()
 
     def test_second_client_is_rejected(self):

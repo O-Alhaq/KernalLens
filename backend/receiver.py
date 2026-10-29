@@ -60,9 +60,12 @@ def main():
     parser.add_argument("--database", help="persist normalized events to this SQLite file")
     parser.add_argument("--rules", help="evaluate rules from this YAML file; alerts go to stderr")
     parser.add_argument("--scoring", help="scoring YAML policy (requires --rules)")
+    parser.add_argument("--correlation", help="correlation YAML policy (requires --rules); incidents go to stderr")
     arguments = parser.parse_args()
     if arguments.scoring and not arguments.rules:
         parser.error("--scoring requires --rules")
+    if arguments.correlation and not arguments.rules:
+        parser.error("--correlation requires --rules")
     engine = None
     finish_reason = "shutdown"
     try:
@@ -85,6 +88,22 @@ def main():
         if arguments.database:
             store = EventStore(arguments.database)
             store.initialize()
+        if arguments.correlation:
+            if __package__:
+                from .correlation import CorrelationEngine
+                from .incident_storage import IncidentStore
+            else:
+                from correlation import CorrelationEngine
+                from incident_storage import IncidentStore
+            correlation = CorrelationEngine.from_file(arguments.correlation)
+            if store is not None:
+                incidents = IncidentStore(arguments.database)
+                engine.subscribe(incidents.insert_alert)
+                correlation.subscribe(incidents.save_incident)
+            correlation.subscribe(lambda incident: print(
+                "Incident: " + json.dumps(incident.to_dict(), separators=(",", ":")),
+                file=sys.stderr, flush=True))
+            engine.subscribe(correlation)
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
             connection.connect(arguments.socket_path)
             if engine is not None:

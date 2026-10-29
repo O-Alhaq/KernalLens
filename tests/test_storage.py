@@ -9,7 +9,7 @@ import unittest
 
 from backend.events import SecurityEvent, normalize_message
 from backend.pipeline import EventRouter, receive_events
-from backend.storage import EventStore
+from backend.storage import EventStore, SCHEMA_VERSION
 from test_host import host_message
 from test_ipc import Chunks, EVENT, STATUS
 import json
@@ -34,7 +34,7 @@ class StorageTests(unittest.TestCase):
         self.store.check_health()
         self.assertEqual(self.store.list_events(), [])
         with closing(sqlite3.connect(self.path)) as connection:
-            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 1)
+            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], SCHEMA_VERSION)
             columns = {row[1] for row in connection.execute("PRAGMA table_info(events)")}
             self.assertEqual(columns, {item.name for item in fields(SecurityEvent)})
 
@@ -97,11 +97,11 @@ class StorageTests(unittest.TestCase):
     def test_future_schema_is_rejected_without_migration(self):
         future = Path(self.directory.name) / "future.db"
         with closing(sqlite3.connect(future)) as connection:
-            connection.execute("PRAGMA user_version=2")
+            connection.execute(f"PRAGMA user_version={SCHEMA_VERSION + 1}")
         with self.assertRaisesRegex(ValueError, "unsupported database schema"):
             EventStore(future).initialize()
         with closing(sqlite3.connect(future)) as connection:
-            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 2)
+            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], SCHEMA_VERSION + 1)
             self.assertEqual(connection.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall(), [])
 
     def test_receiver_stream_routes_all_categories_to_storage_subscriber(self):
