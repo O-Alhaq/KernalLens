@@ -1,3 +1,6 @@
+# Risk is applied after detection; it does not change whether a rule matches.
+# Scan tier scores are absolute (Medium); volume points use only the highest tier.
+# See docs/RULES.md for score examples and fixed severity bands.
 schema_version: 1
 scoring:
   port_scan:

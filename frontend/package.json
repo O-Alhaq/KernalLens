@@ -1,0 +1,10 @@
+{
+  "name": "kernellens-dashboard",
+  "private": true,
+  "version": "0.11.0",
+  "type": "module",
+  "engines": { "node": ">=22.12.0", "npm": ">=10" },
+  "scripts": {"dev": "vite --host 127.0.0.1", "build": "vite build", "preview": "vite preview --host 127.0.0.1", "test": "vitest run"},
+  "dependencies": {"react": "^19.2.0", "react-dom": "^19.2.0", "json-bigint": "^1.0.0"},
+  "devDependencies": {"vite": "^8.0.0", "@vitejs/plugin-react": "^6.0.0", "vitest": "^4.0.0", "jsdom": "^28.0.0", "@testing-library/react": "^16.3.0"}
+}

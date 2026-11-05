@@ -10,7 +10,7 @@ if __package__:
 else:
     from events import SecurityEvent
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 4
 COLUMNS = tuple(item.name for item in fields(SecurityEvent))
 COLUMN_SQL = ", ".join(COLUMNS)
 
@@ -92,13 +92,13 @@ class EventStore:
             connection.close()
 
     def initialize(self):
-        """Apply v1/v2 atomically, tolerate repeat startup, reject newer schemas."""
+        """Apply v1/v2/v3/v4 atomically, tolerate repeat startup, reject newer schemas."""
         with self._connection() as connection:
             connection.execute("PRAGMA journal_mode=WAL")
             with connection:
                 connection.execute("BEGIN IMMEDIATE")
                 version = connection.execute("PRAGMA user_version").fetchone()[0]
-                if version not in (0, 1, SCHEMA_VERSION):
+                if version not in (0, 1, 2, 3, SCHEMA_VERSION):
                     raise ValueError(f"unsupported database schema version: {version}")
                 if version == 0:
                     connection.execute(MIGRATION_1)
@@ -107,7 +107,20 @@ class EventStore:
                 if version < 2:
                     for statement in MIGRATION_2:
                         connection.execute(statement)
-                    connection.execute("PRAGMA user_version=2")
+                if version < 3:
+                    if __package__:
+                        from .dashboard_storage import migrate_dashboard
+                    else:
+                        from dashboard_storage import migrate_dashboard
+                    migrate_dashboard(connection)
+                    connection.execute("PRAGMA user_version=3")
+                if version < 4:
+                    if __package__:
+                        from .operator_time import migrate_operator_time
+                    else:
+                        from operator_time import migrate_operator_time
+                    migrate_operator_time(connection)
+                    connection.execute("PRAGMA user_version=4")
 
     def insert(self, event):
         if not isinstance(event, SecurityEvent):
@@ -133,9 +146,11 @@ class EventStore:
                 f"SELECT {COLUMN_SQL} FROM events WHERE event_id = ?", (event_id,)).fetchone()
         return None if row is None else self._decode(row)
 
-    def list_events(self, *, limit=100, offset=0, event_category=None, event_type=None):
+    def list_events(self, *, limit=100, offset=0, event_category=None, event_type=None, newest_first=False):
         """Return insertion order (oldest first); filters combine with AND."""
         validate_pagination(limit, offset)
+        if type(newest_first) is not bool:
+            raise ValueError("newest_first must be boolean")
         clauses, values = [], []
         for column, value in (("event_category", event_category), ("event_type", event_type)):
             if value is not None:
@@ -146,7 +161,7 @@ class EventStore:
         where = " WHERE " + " AND ".join(clauses) if clauses else ""
         with self._connection() as connection:
             rows = connection.execute(
-                f"SELECT {COLUMN_SQL} FROM events{where} ORDER BY rowid LIMIT ? OFFSET ?",
+                f"SELECT {COLUMN_SQL} FROM events{where} ORDER BY rowid {'DESC' if newest_first else 'ASC'} LIMIT ? OFFSET ?",
                 (*values, limit, offset)).fetchall()
         return [self._decode(row) for row in rows]
 

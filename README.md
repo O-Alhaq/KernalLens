@@ -1,9 +1,149 @@
 # KernelLens
 
-KernelLens is a real-time eBPF-based telemetry framework for hybrid host and network threat detection.
+KernelLens is a Linux security observatory for a single monitored machine. It
+collects network and selected host activity, detects configured patterns, assigns
+risk scores, and groups related detections into explainable Incidents. A local,
+read-only dashboard lets you inspect the evidence. It does not currently block
+traffic or perform response actions.
+
+## Architecture
+
+```text
+Network / Host
+      ↓
+eBPF
+      ↓
+C libbpf Agent
+      ↓
+Unix Socket
+      ↓
+Python Security Core
+      ↓
+SQLite
+      ↓
+FastAPI + WebSocket
+      ↓
+React Dashboard
+```
+
+- **Network/host sensors:** eBPF (extended Berkeley Packet Filter) runs verified
+  observation programs in the Linux kernel. Network capture uses XDP (eXpress
+  Data Path), an early incoming-packet hook; host tracepoints observe execution
+  and selected credential syscalls. Network packets continue with `XDP_PASS`.
+- **C libbpf agent:** loads/attaches the sensors and reads their bounded event
+  buffer. This is the privileged part of the stack.
+- **Unix socket:** a local filesystem-addressed connection carries telemetry
+  from the agent to the normal-user Python receiver.
+- **Python security core:** validates Events, evaluates detection rules, scores
+  Alerts and correlates Incidents. Configuration is explicit YAML, not dashboard
+  logic; no browser is required for detection to continue.
+- **SQLite:** persists Events, Alerts and Incidents, plus bounded live-change
+  references. Receiver and API share one user-owned database file.
+- **FastAPI/WebSocket:** ordinary HTTP endpoints provide history; a WebSocket is
+  a persistent browser/server connection carrying live database changes.
+- **React dashboard:** displays evidence and reconnects/reloads history when
+  needed. Security windows use monotonic timestamps (nanoseconds since boot),
+  while independent persisted UTC times are displayed in `Asia/Amman`.
+
+## Requirements
+
+The automatic development setup targets **Ubuntu 26.04 LTS** on Linux, matching
+the current Ubuntu 26.04.1/generic-kernel lab. You need sudo access, internet access
+for dependency downloads, and an interface/driver supporting native XDP BPF links.
+The kernel needs BTF type information, BPF ring buffers/task helpers and the
+required host syscall tracepoints. A successful build does not prove a restricted
+VM/container or interface supports attachment.
+
+Setup checks/prepares clang/LLVM, bpftool, libbpf/libelf, build tooling, Python and
+venv support, Node **22.12+**, npm **10+**, and project dependencies. If packaged
+npm is older, setup uses a project-local npm 11 without changing global npm.
+A desktop/browser is optional. See [SETUP.md](docs/SETUP.md) for details.
+
+## Quick start
+
+```bash
+git clone https://github.com/O-Alhaq/KernalLens.git
+cd KernalLens
+./scripts/setup.sh
+make dashboard
+```
+
+Run these as your **normal user**. Setup previews and asks before missing Ubuntu
+packages are installed with sudo; Python/npm installs and project builds remain
+unprivileged. Dashboard startup authenticates sudo for only the agent and required
+socket setup. Setup does not start capture automatically.
+
+Useful overrides:
+
+```bash
+make dashboard INTERFACE=ens33          # your actual monitored interface
+make dashboard DATABASE=/tmp/test.db
+make dashboard OPEN_BROWSER=0
+```
+
+Without `INTERFACE`, the launcher detects the unique lowest-metric default-route
+interface. It waits for receiver/API/frontend readiness, then opens
+**http://127.0.0.1:5173/**. Do not expose this unauthenticated development dashboard
+publicly. Run `make help` for supported commands.
+
+## Stop and runtime files
+
+**Press Ctrl+C in the launcher terminal.** Successful intentional shutdown stops
+launcher-owned components, detaches the agent and removes its socket, then returns
+cleanly. Genuine startup/runtime/cleanup failures remain non-zero.
+
+- Database: `/tmp/kernellens.db`, or the exact `DATABASE` override shared by receiver/API.
+  `/tmp` is disposable; use a persistent user-writable location for important history.
+- Logs: `/tmp/kernellens-runtime-<uid>/run-<unique>/`, printed at startup. Separate
+  agent/receiver/API/frontend logs keep high-volume telemetry out of the terminal.
+- Runtime socket: `/run/kernellens/events.sock`; its development permissions are
+  prepared automatically. Do not manually remove an active socket.
+
+## Dashboard
+
+Overview shows persisted totals, severity distribution and connection status.
+Alerts show individual detections and their scores; Incidents show related Alerts
+and correlation evidence; Telemetry shows normalized Events. Select a row/card for
+metadata and technical details. Light/Dark preference is saved locally. API Online
+and Live Connected describe API/database/browser-stream availability, not complete
+sensor or packet-capture health.
+
+## Configuration
+
+Read [RULES.md](docs/RULES.md) before editing:
+
+- `config/rules.yaml`: matching, enabled flags, thresholds and session timing.
+- `config/scoring.yaml`: risk after detection; severity remains score-derived.
+- `config/correlation.yaml`: Alert grouping into Incidents and correlation windows.
+
+Always validate before restarting:
+
+```bash
+make validate-config
+make dashboard
+```
+
+There is no hot reload: stop the current session, validate edits, then restart.
+Existing persisted evidence is not rewritten by policy edits.
+
+## Troubleshooting
+
+Start with [SETUP.md](docs/SETUP.md), which covers missing venv/modules, interface
+selection, occupied ports, sudo/kernel/XDP failures, logs, runtime sockets and
+SQLite ownership. Do not work around permissions by running the whole stack as
+root or by deleting/chowning arbitrary databases. Setup can be rerun safely.
+
+## Technical reference and milestone history
+
+The detailed implementation material below is preserved for deeper study.
+For everyday setup/runtime operations, use the workflow above and SETUP.md.
+Manual component examples require the same normal-user database ownership and
+operator socket access as the launcher; use the launcher's automatic permissions
+rather than running Python under sudo. Historical design/specification documents
+may also describe future scope, not currently implemented response features.
 
 ## Current Milestone
-M10 - Hybrid Correlation and Incidents
+M11 - Real-Time Dashboard
 
 The C XDP program sends packet events through a BPF ring buffer to a C
 libbpf agent. Every packet returns `XDP_PASS`, including when the ring buffer
@@ -14,7 +154,8 @@ routes them to subscribers, and prints the unified model as JSON. Optional SQLit
 persistence and a read-only FastAPI REST API provide the M7 foundation. M8 adds
 an opt-in Python rule engine with YAML configuration and structured alerts.
 M9 scores finalized alerts; M10 correlates related alerts into explainable incidents,
-with optional SQLite persistence and read-only incident retrieval.
+with optional SQLite persistence and read-only incident retrieval. M11 adds a
+React dashboard with bounded WebSocket delivery of committed data.
 
 Host telemetry is opt-in. The network-only invocation below remains unchanged;
 add `--host` to collect process, syscall, and privilege records alongside packets.
@@ -60,7 +201,7 @@ sudo ./build/kernellens-agent INTERFACE /run/kernellens/events.sock
 ```
 
 ```bash
-sudo python3 backend/receiver.py /run/kernellens/events.sock
+.venv/bin/python backend/receiver.py /run/kernellens/events.sock
 ```
 
 To enable host telemetry, start the agent with:
@@ -247,7 +388,7 @@ To also persist them, pass `--database` with a file path. Its parent directory
 must already exist. Start the agent as described above, then run:
 
 ```bash
-sudo .venv/bin/python backend/receiver.py /run/kernellens/events.sock --database /var/lib/kernellens/events.db
+.venv/bin/python backend/receiver.py /run/kernellens/events.sock --database /var/lib/kernellens/events.db
 ```
 
 Create `/var/lib/kernellens` first when using that example. Run the API in a
@@ -282,8 +423,8 @@ return 404. Database operation failures return 503 without database details.
 There are no event-write API endpoints.
 
 `backend/storage.py` implements file-backed `EventStore` using standard
-`sqlite3`. `initialize()` creates the M7 event schema and applies the M10 version-2
-migration transactionally using `PRAGMA user_version`. It preserves existing
+`sqlite3`. `initialize()` creates the M7 event schema and applies the M10 version-2 and M11 version-3/version-4
+migrations transactionally using `PRAGMA user_version`. It preserves existing
 records on repeat startup and rejects unknown versions; there is no schema reset.
 The `events` table contains every SecurityEvent field,
 with indexes on category/type, a unique primary-key event ID, and JSON text
@@ -311,7 +452,7 @@ Install the updated requirements, then opt into detection with `--rules`:
 
 ```bash
 .venv/bin/python -m pip install -r requirements-dev.txt
-sudo .venv/bin/python backend/receiver.py /run/kernellens/events.sock --rules config/rules.yaml --database /var/lib/kernellens/events.db
+.venv/bin/python backend/receiver.py /run/kernellens/events.sock --rules config/rules.yaml --database /var/lib/kernellens/events.db
 ```
 
 The `--database` flag remains optional. Normalized events still go to stdout.
@@ -885,3 +1026,316 @@ git diff --check
 
 The last two fixture commands prepare/check the privileged M2–M5 tests; they do
 not load BPF programs. Running those tests still requires separate approval.
+
+## Real-time dashboard (M11)
+
+M11 adds read-only operator visibility. Detection, session aggregation, scoring,
+correlation, and the C agent's bounded IPC queue remain unchanged.
+
+```text
+C agent → Unix socket → receiver / security core
+                              ↓ committed persistence
+                            SQLite
+                  events / alerts / incidents
+                  + bounded change-reference journal
+                              ↓ once per second, worker-thread read
+                        FastAPI process
+                      REST       WebSocket
+                         ↘       ↙
+                       React / Vite
+```
+
+The receiver and API are **separate processes sharing the same database file**.
+There is no shared-memory publisher between them. Database triggers atomically
+write change references with persisted records; the API reads committed changes
+off its event loop and publishes them to connected browsers. No browser, WebSocket,
+or API process is required for detection to continue. Alerts now persist whenever
+`--rules` and `--database` are set, including without `--correlation`.
+
+### Install and start
+
+Use Node **22.12+** and npm **10+** (npm 11 is verified), plus the existing Python
+virtual environment. Dependencies and exact frontend versions are in the lockfile.
+
+```bash
+.venv/bin/python -m pip install -r requirements-dev.txt
+npm --prefix frontend install
+```
+
+If the system npm is 9.2.0 and fails with an Arborist `edgesOut` error, use a current
+npm without a global/root install:
+
+```bash
+npx --yes --package npm@11 npm --prefix frontend install
+```
+
+The primary development/demo workflow is now one foreground command from the
+repository directory, as your **normal user**:
+
+```bash
+make dashboard
+```
+
+Optional overrides:
+
+```bash
+make dashboard INTERFACE=ens33
+make dashboard DATABASE=/tmp/test.db
+make dashboard OPEN_BROWSER=0
+# Combine options as needed:
+make dashboard INTERFACE=ens33 DATABASE=/tmp/test.db OPEN_BROWSER=0
+```
+
+If no interface is specified, the launcher reads `ip -j route show default` and
+selects the unique lowest-metric interface. An absent/ambiguous route produces an
+error asking for `INTERFACE=<name>`. It prints the selected interface and absolute
+database path before starting capture. The default database is `/tmp/kernellens.db`.
+Existing history is preserved; a new database is created/migrated by the normal
+user. Both receiver and FastAPI receive the exact same absolute path.
+
+The launcher checks occupied ports 8000/5173, active telemetry sockets, database
+and WAL/SHM ownership/writability, the venv and installed frontend packages. It
+runs an incremental `make all`, then authenticates sudo once in the terminal.
+Only the C/eBPF agent and its small runtime/cleanup helper run privileged. The
+agent starts with `--host` to enable the existing network and host sensors.
+Receiver, FastAPI and Vite remain normal-user processes. No dependency installation
+is performed automatically. `DASHBOARD_PYTHON=/absolute/path/to/python` can select
+another prepared interpreter; the default is `.venv/bin/python`.
+
+Startup waits up to 20 seconds per readiness stage. The root helper creates or
+validates the fixed `/run/kernellens` directory, waits for the agent's socket,
+sets directory mode **0711**, and assigns `events.sock` to the launching UID/GID
+with mode **0660**. The receiver starts only after those permissions are ready;
+its actual agent-ready handshake must succeed before API startup continues.
+A stale socket is removed only when it is a real socket and `/proc/net/unix`
+shows no owning socket. Active sockets, symlinks and other files are never removed.
+The agent itself also refuses an existing path when binding.
+
+The API must answer `/health` with a healthy database, and Vite must answer HTTP
+before `xdg-open` is invoked. The launcher supplies the existing frontend config
+variables for `http://127.0.0.1:8000` and
+`ws://127.0.0.1:8000/ws/live`; Vite binds only to `127.0.0.1:5173` with a strict
+port. If no desktop/opener is available, it prints the URL and keeps running.
+`OPEN_BROWSER=0` suppresses automatic opening.
+
+**Press Ctrl+C in the launcher terminal to stop the stack.** SIGTERM, SIGHUP,
+startup failures and unexpected component exits also invoke cleanup. Shell traps
+forward terminal signals to the supervisor and wait for cleanup. The supervisor
+tracks child PIDs and owned process groups, including npm/Vite descendants; it
+never uses broad process-name killing. The receiver receives SIGINT so its existing
+finalization path runs. Closing the root helper's control pipe requests agent
+SIGTERM and the agent's existing XDP/tracepoint/socket cleanup, without needing
+another sudo authentication after a long session. No background daemon or PID-file
+stop command is required for this foreground workflow.
+
+Each launch prints a private log directory, normally:
+
+```text
+/tmp/kernellens-runtime-<uid>/run-<unique>/
+    dependencies.log
+    build.log
+    agent.log
+    receiver.log
+    api.log
+    frontend.log
+    browser.log       # when an opener is started
+```
+
+Detailed telemetry stays in logs. A per-user lock prevents duplicate launchers;
+a separate root runtime lock protects the shared agent socket across users.
+Logs are retained for troubleshooting and are not automatically rotated/deleted.
+
+Common startup errors:
+
+- **Port or socket occupied:** stop its owning service deliberately and retry;
+  the launcher does not stop pre-existing processes or connect to an active socket.
+- **Database ownership/readonly error:** choose a user-owned `DATABASE` or repair
+  that specific database and its WAL/SHM files separately. The launcher never
+  chowns, deletes or recreates an existing configured database.
+- **Missing .venv/packages/build prerequisite:** install the dependencies above
+  (plus clang, bpftool and libbpf for the agent); inspect `dependencies.log` or
+  `build.log`. No sudo pip/npm installation is added.
+- **Socket/receiver/API/frontend readiness timeout:** inspect that component's
+  log. Started components are stopped; the browser is not opened prematurely.
+- **Unsafe runtime directory:** `/run/kernellens` must be a real root-owned
+  directory without group/other write access. The launcher refuses a symlink or
+  unsafe existing directory instead of changing an arbitrary directory's owner.
+- **Sudo/terminal failure:** run from an interactive terminal as the normal user
+  with sudo permission. Do not run `sudo make dashboard`.
+
+This is a Linux **development/demo runtime policy** for the existing M11 stack.
+A production deployment may use systemd `RuntimeDirectory`, a dedicated KernelLens
+group, service User/Group settings or tmpfiles.d. A service-manager redesign is
+outside this change. SIGKILL/power loss cannot run shell cleanup traps; inspect
+remaining runtime state before a new session. The root helper still observes
+control-pipe EOF if its normal supervisor disappears. The launcher does not
+replace sensor health monitoring or add security response actions.
+
+#### Manual component startup (optional troubleshooting)
+
+Run API and receiver as the **same operating-system user** so SQLite database,
+WAL and shared-memory files remain accessible. Both need the same absolute path:
+
+```bash
+# API terminal (creates/migrates the database; binds only to loopback)
+KERNELLENS_DATABASE=/tmp/kernellens-m11.db \
+  .venv/bin/python -m uvicorn backend.api:app --host 127.0.0.1 --port 8000
+
+# Receiver terminal, after the operator has access to the agent socket
+.venv/bin/python backend/receiver.py /run/kernellens/events.sock \
+  --rules config/rules.yaml --scoring config/scoring.yaml \
+  --correlation config/correlation.yaml --database /tmp/kernellens-m11.db \
+  > /tmp/kernellens-events.jsonl
+
+# Frontend terminal
+npm --prefix frontend run dev
+```
+
+Open **http://127.0.0.1:5173**. The API is **http://127.0.0.1:8000** and the stream
+is **ws://127.0.0.1:8000/ws/live**. For a root-owned agent socket, see the manual lab
+setup in [M11_REPORT.md](docs/M11_REPORT.md); the API does not need root privileges.
+
+Optional frontend configuration goes in `frontend/.env.local`:
+
+```dotenv
+VITE_API_BASE_URL=http://127.0.0.1:8000
+VITE_WS_URL=ws://127.0.0.1:8000/ws/live
+```
+
+These are build-time public URLs, not secrets. The defaults above are centralized
+in `frontend/src/config.js`. `frontend/.env.example` is provided. Restart Vite or
+rebuild after changes. Development origins default only to
+`http://localhost:5173` and `http://127.0.0.1:5173`. Set the comma-separated
+`KERNELLENS_UI_ORIGINS` for other explicit origins; `*` is rejected. The same list
+is enforced for browser WebSocket handshakes. There is no authentication/RBAC in
+M11: keep services local or within a trusted controlled lab, not publicly exposed.
+
+### Read-only endpoints
+
+| Endpoint | Purpose |
+| --- | --- |
+| `GET /health` | Existing API/database health |
+| `GET /events`, `GET /events/{event_id}` | Existing normalized telemetry |
+| `GET /alerts`, `GET /alerts/{alert_id}` | Stored final scored Alerts |
+| `GET /incidents`, `GET /incidents/{incident_id}` | Stored Incident snapshots |
+| `GET /dashboard/summary` | Transactionally maintained totals and severity distributions |
+| `GET /dashboard/snapshot` | One consistent read of recent records, summary and live cursor |
+| `WS /ws/live` | Versioned live notifications and database/stream status |
+
+List endpoints keep `limit=100`, maximum 1000, and nonnegative `offset`. Existing
+oldest-first ordering remains the default; `newest_first=true` is optional.
+Events filter by `event_category`/`event_type`; Alerts by
+`severity`/`event_category`/`alert_type`; Incidents by `severity`/`incident_type`.
+Filters combine with AND; missing IDs return 404, invalid pagination 422. No
+write/action endpoints were added. IDs are treated as lookup keys, including an
+unknown/malformed ID returning 404, consistent with M7.
+
+`/dashboard/snapshot` returns `cursor`, `summary`, `events`, `alerts`, and
+`incidents`. It is a single SQLite read transaction, capped at 100 Events, 100
+Alerts, and 50 Incidents. Events/Alerts use latest insertion order; Incidents use
+latest change order, so a recently updated existing Incident appears again.
+Summary totals count all persisted records, not just visible recent rows. Counts
+and per-severity totals are maintained transactionally; requests do not repeatedly
+scan the full event history. No ambiguous wall-clock “last hour” counters are added.
+
+The versioned WebSocket envelope is:
+
+```json
+{
+  "schema_version": 1,
+  "message_type": "alert",
+  "sequence": 123,
+  "data": {"alert_id": "...", "risk_score": 40, "severity": "medium"}
+}
+```
+
+The example projects a few fields; actual `data` contains the unchanged complete
+Event, Alert or Incident model. Types are `event`, `alert`, `incident`, `status`.
+A `status` message can contain `database`, `summary`, and `resync_required`; the
+initial connection status has no sequence. Data messages use the persisted change
+sequence; Incident references resolve to the newest snapshot/revision in the
+read transaction. Browser-to-server application messages are rejected with 1008.
+
+### Bounds and recovery
+
+| Resource | Bound/behavior |
+| --- | --- |
+| SQLite change journal | 512 ID-only references per family (1536 total) |
+| Read batch | At most 128 references per family per poll |
+| Poll interval | One second, only while clients are connected |
+| WebSocket clients | 16 per API process |
+| Each client queue | 256 messages and 4 MiB queued payload |
+| Individual live message | 1 MiB; oversized messages disconnect for REST recovery |
+| Send timeout | 5 seconds |
+| Frontend recent lists | 100 Events, 100 Alerts, 50 Incidents |
+| Frontend REST handoff buffer | 256 live messages |
+
+Queues are owned by the API event loop. SQLite work runs in a worker thread and
+never touches those queues. Queue overflow or stalled sends disconnect the slow
+client (1013); other clients and security processing continue. A detected journal
+gap sends `resync_required`; it does not pretend the live feed is complete.
+Large bursts may produce sampled live activity, but persisted records remain
+queryable. Database history grows as before; bounded journal retention is not a
+historical data-retention policy.
+
+The dashboard loads REST history immediately and starts another authoritative
+snapshot after each WebSocket handshake. It buffers live messages during that
+read, ignores changes at/before its snapshot cursor, then merges newer records by
+`event_id`, `alert_id`, or `incident_id`. Repeated Incident snapshots update one
+entry and any open detail panel. Counters come from backend summaries, not browser
+risk calculations or guessed increments. On disconnection, it shows Reconnecting,
+retries after 1, 2, 4, 8, 16, then at most 30 seconds, and reloads REST after
+reconnection. Backoff resets only after a stable 30-second connection. REST errors
+retain existing rows and retry after five seconds; malformed live data triggers
+reconnection. API restarts/reloads recover through REST, not a permanent replay log.
+
+### Dashboard and timestamps
+
+Overview provides totals, severity distribution, API/database status, and live
+connection status. Alerts expose rule, type, risk, severity, category and entities;
+Incidents expose risk, status, member count and primary entities. Telemetry shows
+source, event type, process/PID and network context. Rows/cards open a detail panel
+with metadata and complete evidence available on demand. Incident details show
+member IDs and correlation reason. Hybrid details explicitly state that temporal/
+contextual correlation does **not** prove exact process-to-network attribution.
+
+Risk and the four severity labels come directly from the backend. Color is paired
+with visible text. Empty/loading/error states are explicit. Layouts support
+narrow screens with horizontally scrollable data tables.
+
+Security timestamps remain **monotonic nanoseconds since boot**, exact in
+storage and browser memory and available in technical details. Security logic
+never uses calendar time. Additive schema v4 stores independent UTC persistence
+clocks in `operator_times`; REST/live presentation exposes `wall_clock_timestamp`
+for Events/Alerts and `created_at` / `updated_at` for Incidents. React converts
+these with `Intl.DateTimeFormat` in `Asia/Amman`. Legacy or invalid calendar
+values show `Time unavailable`; no boot timestamp is interpreted as Unix time.
+Display clocks describe persistence and depend on host clock accuracy.
+
+The header Light/Dark button switches shared semantic CSS tokens. Explicit
+choices persist in localStorage as `kernellens-theme`; saved choices override
+the initial operating-system preference. Theme initializes before React renders.
+Both modes retain labelled severity, status, details and responsive tables.
+Theme changes preserve records and the live connection. “API: Online” means a
+dashboard/database read succeeded, not that the agent is healthy.
+
+### Validation and manual demonstration
+
+```bash
+npm --prefix frontend test
+npm --prefix frontend run build
+.venv/bin/python -m unittest discover -s tests -p test_dashboard.py -v
+.venv/bin/python -m unittest discover -s tests -v
+make clean
+make test PYTHON=.venv/bin/python
+make build/host-activity
+bash -n tests/m2_pipeline.sh
+make -n test-m2 test-m3 test-m4 test-m5
+git diff --check
+```
+
+See [docs/M11_REPORT.md](docs/M11_REPORT.md) for results, the controlled nmap/SYN
+lab demonstration, troubleshooting, and known limitations. The frontend production
+bundle is `frontend/dist/`; `npm --prefix frontend run preview -- --port 5173`
+previews it locally with the default allowed origin. Deployment hosting and
+public access controls are outside this milestone.

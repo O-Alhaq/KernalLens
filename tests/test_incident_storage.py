@@ -12,6 +12,7 @@ from unittest.mock import patch
 from fastapi.testclient import TestClient
 
 from backend.api import create_app
+from backend.dashboard_storage import DashboardStore
 from backend.correlation import CorrelationEngine
 from backend.incident_storage import IncidentStore
 from backend.pipeline import EventRouter
@@ -56,7 +57,7 @@ class IncidentStorageTests(unittest.TestCase):
         with closing(sqlite3.connect(path)) as connection:
             self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], SCHEMA_VERSION)
             self.assertEqual({row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")},
-                             {"events", "alerts", "incidents", "incident_alerts"})
+                             {"events", "alerts", "incidents", "incident_alerts", "live_changes", "dashboard_counts", "live_pruned", "sqlite_sequence", "operator_times"})
             self.assertEqual(len(connection.execute("PRAGMA foreign_key_list(incident_alerts)").fetchall()), 2)
 
     def test_migration_failure_rolls_back_without_losing_telemetry(self):
@@ -138,10 +139,10 @@ class IncidentStorageTests(unittest.TestCase):
         item = snapshots[-1]
         with TestClient(create_app(self.path)) as client:
             self.assertEqual(client.get("/health").status_code, 200)
-            self.assertEqual(client.get("/incidents").json(), [item.to_dict()])
-            self.assertEqual(client.get(f"/incidents/{item.incident_id}").json(), item.to_dict())
+            self.assertEqual(client.get("/incidents").json(), [DashboardStore(self.path).operator_record("incident", item.to_dict())])
+            self.assertEqual(client.get(f"/incidents/{item.incident_id}").json(), DashboardStore(self.path).operator_record("incident", item.to_dict()))
             self.assertEqual(client.get("/incidents/missing").status_code, 404)
-            self.assertEqual(client.get("/incidents", params={"incident_type": "network_sequence", "severity": "high"}).json(), [item.to_dict()])
+            self.assertEqual(client.get("/incidents", params={"incident_type": "network_sequence", "severity": "high"}).json(), [DashboardStore(self.path).operator_record("incident", item.to_dict())])
             self.assertEqual(client.get("/incidents", params={"offset": 1, "limit": 1}).json(), [])
             self.assertEqual(client.get("/incidents", params={"severity": "low"}).json(), [])
             self.assertEqual(client.post("/incidents", json={}).status_code, 405)
@@ -183,7 +184,7 @@ class IncidentStorageTests(unittest.TestCase):
         self.assertEqual(len(alerts), 2)
         with TestClient(create_app(self.path)) as client:
             self.assertEqual(len(client.get("/events").json()), 50)
-            self.assertEqual(client.get("/incidents").json(), [incidents[0].to_dict()])
+            self.assertEqual(client.get("/incidents").json(), [DashboardStore(self.path).operator_record("incident", incidents[0].to_dict())])
 
     def test_host_normalization_to_incident_and_api(self):
         rules = parse_rules({"schema_version": 1, "rules": [rule("process_match", base_score=30),
@@ -203,4 +204,4 @@ class IncidentStorageTests(unittest.TestCase):
         self.assertEqual(result.risk_score, 35)
         self.assertEqual(result.primary_entities, {"pid": process.pid})
         with TestClient(create_app(self.path)) as client:
-            self.assertEqual(client.get(f"/incidents/{result.incident_id}").json(), result.to_dict())
+            self.assertEqual(client.get(f"/incidents/{result.incident_id}").json(), DashboardStore(self.path).operator_record("incident", result.to_dict()))

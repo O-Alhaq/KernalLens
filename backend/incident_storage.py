@@ -65,7 +65,7 @@ class IncidentStore(EventStore):
                         or old.created_timestamp < incident.created_timestamp
                         or old.risk_score > incident.risk_score):
                     raise ValueError("conflicting or stale incident update")
-            connection.execute("""INSERT INTO incidents VALUES (?, ?, ?, ?)
+            connection.execute("""INSERT INTO incidents (incident_id, incident_type, severity, record) VALUES (?, ?, ?, ?)
                 ON CONFLICT(incident_id) DO UPDATE SET severity=excluded.severity, record=excluded.record""",
                 (incident.incident_id, incident.incident_type, incident.severity, _encode(incident)))
             connection.executemany("INSERT OR IGNORE INTO incident_alerts VALUES (?, ?)",
@@ -76,8 +76,10 @@ class IncidentStore(EventStore):
             row = connection.execute("SELECT record FROM incidents WHERE incident_id=?", (incident_id,)).fetchone()
         return None if row is None else Incident.from_dict(json.loads(row[0]))
 
-    def list_incidents(self, *, limit=100, offset=0, incident_type=None, severity=None):
+    def list_incidents(self, *, limit=100, offset=0, incident_type=None, severity=None, newest_first=False):
         validate_pagination(limit, offset)
+        if type(newest_first) is not bool:
+            raise ValueError("newest_first must be boolean")
         clauses, values = [], []
         for column, value in (("incident_type", incident_type), ("severity", severity)):
             if value is not None:
@@ -87,6 +89,24 @@ class IncidentStore(EventStore):
                 values.append(value)
         where = " WHERE " + " AND ".join(clauses) if clauses else ""
         with self._connection() as connection:
-            rows = connection.execute(f"SELECT record FROM incidents{where} ORDER BY rowid LIMIT ? OFFSET ?",
+            rows = connection.execute(f"SELECT record FROM incidents{where} ORDER BY rowid {'DESC' if newest_first else 'ASC'} LIMIT ? OFFSET ?",
                                       (*values, limit, offset)).fetchall()
         return [Incident.from_dict(json.loads(row[0])) for row in rows]
+
+    def list_alerts(self, *, limit=100, offset=0, severity=None, event_category=None,
+                    alert_type=None, newest_first=False):
+        validate_pagination(limit, offset)
+        if type(newest_first) is not bool:
+            raise ValueError("newest_first must be boolean")
+        clauses, values = [], []
+        for field, value in (("severity", severity), ("event_category", event_category), ("alert_type", alert_type)):
+            if value is not None:
+                if not isinstance(value, str):
+                    raise ValueError(f"{field} must be a string")
+                clauses.append(f"json_extract(record, '$.{field}')=?")
+                values.append(value)
+        where = " WHERE " + " AND ".join(clauses) if clauses else ""
+        with self._connection() as connection:
+            rows = connection.execute(f"SELECT record FROM alerts{where} ORDER BY rowid {'DESC' if newest_first else 'ASC'} LIMIT ? OFFSET ?",
+                                      (*values, limit, offset)).fetchall()
+        return [json.loads(row[0]) for row in rows]

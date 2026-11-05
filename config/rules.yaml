@@ -1,3 +1,6 @@
+# Detection only; scoring and correlation are separate. See docs/RULES.md.
+# Network thresholds count distinct ports for scans, matching packets for floods.
+# Times are seconds; maximum lifetime starts at threshold confirmation.
 schema_version: 1
 rules:
   - id: port_scan_basic
@@ -7,7 +10,7 @@ rules:
     type: port_scan
     threshold: 10
     window_seconds: 5
-    quiet_seconds: 3
+    quiet_seconds: 3  # Finalize only after matching activity stops.
     max_detection_seconds: 60
     max_event_ids: 64
     max_groups: 128
@@ -20,12 +23,13 @@ rules:
     type: syn_flood
     threshold: 1000
     window_seconds: 5
-    quiet_seconds: 3
+    quiet_seconds: 3  # Finalize only after matching activity stops.
     max_detection_seconds: 60
     max_event_ids: 64
     max_groups: 128
     description: One source sent at least 1000 TCP SYN attempts to one destination in five seconds.
 
+  # Disabled example: tune against baseline packet-event volume before enabling.
   - id: traffic_flood_example
     name: IPv4 Traffic Flood
     enabled: false
@@ -33,12 +37,13 @@ rules:
     type: traffic_flood
     threshold: 2000
     window_seconds: 5
-    quiet_seconds: 3
+    quiet_seconds: 3  # Finalize only after matching activity stops.
     max_detection_seconds: 60
     max_event_ids: 64
     max_groups: 128
     description: Example volume rule; enable and tune for the observed network.
 
+  # Disabled example: exact name selector, not a wildcard or regex.
   - id: process_example
     name: Configured Process Watch
     enabled: false

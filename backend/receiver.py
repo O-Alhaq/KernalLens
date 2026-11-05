@@ -88,6 +88,13 @@ def main():
         if arguments.database:
             store = EventStore(arguments.database)
             store.initialize()
+        if engine is not None and store is not None:
+            if __package__:
+                from .incident_storage import IncidentStore
+            else:
+                from incident_storage import IncidentStore
+            incidents = IncidentStore(arguments.database)
+            engine.subscribe(incidents.insert_alert)
         if arguments.correlation:
             if __package__:
                 from .correlation import CorrelationEngine
@@ -97,8 +104,6 @@ def main():
                 from incident_storage import IncidentStore
             correlation = CorrelationEngine.from_file(arguments.correlation)
             if store is not None:
-                incidents = IncidentStore(arguments.database)
-                engine.subscribe(incidents.insert_alert)
                 correlation.subscribe(incidents.save_incident)
             correlation.subscribe(lambda incident: print(
                 "Incident: " + json.dumps(incident.to_dict(), separators=(",", ":")),

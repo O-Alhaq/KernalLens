@@ -12,9 +12,17 @@ from uuid import uuid4
 from fastapi.testclient import TestClient
 
 from backend.api import create_app
+
 from backend.storage import EventStore
 import test_ipc
 from test_storage import sample_events
+
+
+def security_only(value):
+    if isinstance(value, list):
+        return [security_only(item) for item in value]
+    return {key: item for key, item in value.items() if key != "wall_clock_timestamp"}
+
 
 
 class ApiTests(unittest.TestCase):
@@ -40,25 +48,25 @@ class ApiTests(unittest.TestCase):
             self.store.insert(event)
         response = self.client.get("/events")
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.json(), [event.to_dict() for event in events])
+        self.assertEqual(security_only(response.json()), [event.to_dict() for event in events])
         for event in events:
             response = self.client.get(f"/events/{event.event_id}")
             self.assertEqual(response.status_code, 200)
-            self.assertEqual(response.json(), event.to_dict())
+            self.assertEqual(security_only(response.json()), event.to_dict())
         # A separate app/connection can see committed telemetry.
         with TestClient(create_app(self.path)) as reopened:
-            self.assertEqual(reopened.get("/events").json(), [event.to_dict() for event in events])
+            self.assertEqual(security_only(reopened.get("/events").json()), [event.to_dict() for event in events])
 
     def test_filters_pagination_missing_and_invalid_parameters(self):
         events = sample_events()
         for event in events:
             self.store.insert(event)
         response = self.client.get("/events", params={"limit": 2, "offset": 1})
-        self.assertEqual(response.json(), [event.to_dict() for event in events[1:3]])
+        self.assertEqual(security_only(response.json()), [event.to_dict() for event in events[1:3]])
         for event in events:
             response = self.client.get("/events", params={"event_category": event.event_category,
                                                          "event_type": event.event_type})
-            self.assertEqual(response.json(), [event.to_dict()])
+            self.assertEqual(security_only(response.json()), [event.to_dict()])
         for params in ({"event_category": "unknown"}, {"offset": 100},
                        {"event_category": "network", "event_type": "process_exec"},
                        {"event_type": "' OR 1=1 --"}):
@@ -111,11 +119,11 @@ class PersistentTransportTests(unittest.TestCase):
             with TestClient(create_app(database)) as client:
                 response = client.get("/events")
                 self.assertEqual(response.status_code, 200)
-                self.assertEqual(response.json(), printed)
+                self.assertEqual(security_only(response.json()), printed)
                 self.assertEqual([event["event_category"] for event in printed],
                                  ["network", "process", "syscall", "privilege"])
                 for event in printed:
-                    self.assertEqual(client.get(f'/events/{event["event_id"]}').json(), event)
+                    self.assertEqual(security_only(client.get(f'/events/{event["event_id"]}').json()), event)
         finally:
             if receiver.poll() is None:
                 receiver.kill()

@@ -9,3 +9,9 @@ node_modules/
 *.db
 *.db-wal
 *.db-shm
+
+frontend/dist/
+frontend/.env.local
+frontend/.env.*.local
+
+.tools/
